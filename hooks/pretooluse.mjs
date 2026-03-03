@@ -12,7 +12,7 @@
 
 import { readFileSync, writeFileSync, existsSync, rmSync, cpSync, readdirSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { homedir, tmpdir } from "node:os";
 import { ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE } from "./routing-block.mjs";
 
@@ -20,7 +20,8 @@ import { ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE } from "./routing-block.mjs
 let security = null;
 try {
   const __hookDir = dirname(fileURLToPath(import.meta.url));
-  security = await import(resolve(__hookDir, "..", "build", "security.js"));
+  const secPath = resolve(__hookDir, "..", "build", "security.js");
+  security = await import(pathToFileURL(secPath).href);
 } catch {
   // Build not available — skip security checks, rely on existing routing
 }
