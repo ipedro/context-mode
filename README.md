@@ -184,6 +184,130 @@ Fetch the React useEffect docs, index them, and find the cleanup pattern
 with code examples. Then run /context-mode:stats.
 ```
 
+## Security
+
+Context Mode enforces the same permission rules you already use in Claude Code — but extends them to the MCP sandbox. If you block `sudo` in Claude Code, it's also blocked inside `execute`, `execute_file`, and `batch_execute`.
+
+**Zero setup required.** If you haven't configured any permissions, nothing changes. This only activates when you add rules.
+
+### Getting started
+
+Find your settings file:
+
+```bash
+# macOS / Linux
+cat ~/.claude/settings.json
+
+# Windows
+type %USERPROFILE%\.claude\settings.json
+```
+
+Add a `permissions` section (keep your existing settings, just add this block). Then restart Claude Code.
+
+```json
+{
+  "permissions": {
+    "deny": [
+      "Bash(sudo *)",
+      "Bash(rm -rf /*)",
+      "Read(.env)",
+      "Read(**/.env*)"
+    ],
+    "allow": [
+      "Bash(git:*)",
+      "Bash(npm:*)"
+    ]
+  }
+}
+```
+
+The pattern is `Tool(what to match)` where `*` means "anything".
+
+<details>
+<summary><strong>Common deny patterns</strong> (click to expand)</summary>
+
+**Dangerous commands:**
+```
+"Bash(sudo *)"              — block all sudo commands
+"Bash(rm -rf /*)"           — block recursive delete from root
+"Bash(chmod 777 *)"         — block open permissions
+"Bash(shutdown *)"          — block shutdown/reboot
+"Bash(kill -9 *)"           — block force kill
+"Bash(mkfs *)"              — block filesystem format
+"Bash(dd *)"                — block disk write
+```
+
+**Network access:**
+```
+"Bash(curl *)"              — block curl
+"Bash(wget *)"              — block wget
+"Bash(ssh *)"               — block ssh connections
+"Bash(scp *)"               — block secure copy
+"Bash(nc *)"                — block netcat
+```
+
+**Package managers and deploys:**
+```
+"Bash(npm publish *)"       — block npm publish
+"Bash(docker push *)"       — block docker push
+"Bash(pip install *)"       — block pip install
+"Bash(brew install *)"      — block brew install
+"Bash(apt install *)"       — block apt install
+"Bash(wrangler deploy *)"   — block Cloudflare deploys
+"Bash(terraform apply *)"   — block terraform apply
+"Bash(kubectl delete *)"    — block k8s delete
+```
+
+**Sensitive files:**
+```
+"Read(.env)"                — block .env in project root
+"Read(**/.env*)"            — block .env files everywhere
+"Read(**/*secret*)"         — block files with "secret" in the name
+"Read(**/*credential*)"     — block credential files
+"Read(**/*.pem)"            — block private keys
+"Read(**/*id_rsa*)"         — block SSH keys
+```
+
+</details>
+
+<details>
+<summary><strong>Common allow patterns</strong> (click to expand)</summary>
+
+```
+"Bash(git:*)"               — allow git (with or without args)
+"Bash(npm:*)"               — allow npm
+"Bash(npx:*)"               — allow npx
+"Bash(node:*)"              — allow node
+"Bash(python:*)"            — allow python
+"Bash(ls:*)"                — allow ls
+"Bash(cat:*)"               — allow cat
+"Bash(echo:*)"              — allow echo
+"Bash(grep:*)"              — allow grep
+"Bash(make:*)"              — allow make
+```
+
+</details>
+
+### Chained commands
+
+Commands chained with `&&`, `;`, or `|` are split — each part is checked separately:
+
+```
+echo hello && sudo rm -rf /tmp
+```
+
+Blocked. Even though it starts with `echo`, the `sudo` part matches the deny rule.
+
+### Where to put rules
+
+Rules can go in three places (checked in this order):
+
+1. `.claude/settings.local.json` — this project only (gitignored)
+2. `.claude/settings.json` — this project, shared with team
+3. `~/.claude/settings.json` — all projects
+
+**deny** always wins over **allow**. More specific (project-level) rules override global ones.
+
 ## Requirements
 
 - **Node.js 18+**
