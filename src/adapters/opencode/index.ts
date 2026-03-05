@@ -1,0 +1,453 @@
+/**
+ * adapters/opencode — OpenCode platform adapter.
+ *
+ * Implements HookAdapter for OpenCode's TypeScript plugin paradigm.
+ *
+ * OpenCode hook specifics:
+ *   - I/O: TS plugin functions (not JSON stdin/stdout)
+ *   - Hook names: tool.execute.before, tool.execute.after, experimental.session.compacting
+ *   - Arg modification: output.args mutation
+ *   - Blocking: throw Error in tool.execute.before
+ *   - Output modification: output.output mutation (TUI bug for bash #13575)
+ *   - SessionStart: broken (#14808, no hook #5409)
+ *   - Session ID: input.sessionID (camelCase!)
+ *   - Project dir: ctx.directory in plugin init (no env var)
+ *   - Config: opencode.json plugin array, .opencode/plugins/*.ts
+ *   - Session dir: ~/.config/opencode/context-mode/sessions/
+ */
+
+import { createHash } from "node:crypto";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  copyFileSync,
+  accessSync,
+  constants,
+} from "node:fs";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
+
+import type {
+  HookAdapter,
+  HookParadigm,
+  PlatformCapabilities,
+  DiagnosticResult,
+  PreToolUseEvent,
+  PostToolUseEvent,
+  PreCompactEvent,
+  SessionStartEvent,
+  PreToolUseResponse,
+  PostToolUseResponse,
+  PreCompactResponse,
+  SessionStartResponse,
+  HookRegistration,
+  RoutingInstructionsConfig,
+} from "../types.js";
+
+// ─────────────────────────────────────────────────────────
+// OpenCode raw input types
+// ─────────────────────────────────────────────────────────
+
+interface OpenCodeHookInput {
+  tool_name?: string;
+  tool_input?: Record<string, unknown>;
+  tool_output?: string;
+  is_error?: boolean;
+  /** OpenCode uses camelCase for session ID. */
+  sessionID?: string;
+  source?: string;
+}
+
+// ─────────────────────────────────────────────────────────
+// Hook constants (re-exported from hooks.ts)
+// ─────────────────────────────────────────────────────────
+
+import { HOOK_TYPES as OPENCODE_HOOK_NAMES } from "./hooks.js";
+
+// ─────────────────────────────────────────────────────────
+// Adapter implementation
+// ─────────────────────────────────────────────────────────
+
+export class OpenCodeAdapter implements HookAdapter {
+  readonly name = "OpenCode";
+  readonly paradigm: HookParadigm = "ts-plugin";
+
+  readonly capabilities: PlatformCapabilities = {
+    preToolUse: true,
+    postToolUse: true,
+    preCompact: true, // experimental
+    sessionStart: false, // broken (#14808, no hook #5409)
+    canModifyArgs: true,
+    canModifyOutput: true, // with TUI bug caveat for bash (#13575)
+    canInjectSessionContext: false,
+  };
+
+  // ── Input parsing ──────────────────────────────────────
+
+  parsePreToolUseInput(raw: unknown): PreToolUseEvent {
+    const input = raw as OpenCodeHookInput;
+    return {
+      toolName: input.tool_name ?? "",
+      toolInput: input.tool_input ?? {},
+      sessionId: this.extractSessionId(input),
+      projectDir: undefined, // OpenCode uses ctx.directory in plugin init, not env var
+      raw,
+    };
+  }
+
+  parsePostToolUseInput(raw: unknown): PostToolUseEvent {
+    const input = raw as OpenCodeHookInput;
+    return {
+      toolName: input.tool_name ?? "",
+      toolInput: input.tool_input ?? {},
+      toolOutput: input.tool_output,
+      isError: input.is_error,
+      sessionId: this.extractSessionId(input),
+      projectDir: undefined,
+      raw,
+    };
+  }
+
+  parsePreCompactInput(raw: unknown): PreCompactEvent {
+    const input = raw as OpenCodeHookInput;
+    return {
+      sessionId: this.extractSessionId(input),
+      projectDir: undefined,
+      raw,
+    };
+  }
+
+  parseSessionStartInput(_raw: unknown): SessionStartEvent {
+    // SessionStart is not supported in OpenCode (#14808, #5409).
+    // This method exists to satisfy the interface but should not be called.
+    throw new Error(
+      "OpenCode does not support SessionStart hooks (see issues #14808, #5409)",
+    );
+  }
+
+  // ── Response formatting ────────────────────────────────
+
+  formatPreToolUseResponse(response: PreToolUseResponse): unknown {
+    if (response.decision === "deny") {
+      // OpenCode TS plugin paradigm: throw Error to block
+      throw new Error(
+        response.reason ?? "Blocked by context-mode hook",
+      );
+    }
+    if (response.decision === "modify" && response.updatedInput) {
+      // OpenCode: output.args mutation
+      return { args: response.updatedInput };
+    }
+    // "allow" — return undefined for passthrough
+    return undefined;
+  }
+
+  formatPostToolUseResponse(response: PostToolUseResponse): unknown {
+    const result: Record<string, unknown> = {};
+    if (response.updatedOutput) {
+      // OpenCode: output.output mutation (TUI bug for bash #13575)
+      result.output = response.updatedOutput;
+    }
+    if (response.additionalContext) {
+      result.additionalContext = response.additionalContext;
+    }
+    return Object.keys(result).length > 0 ? result : undefined;
+  }
+
+  formatPreCompactResponse(response: PreCompactResponse): unknown {
+    // experimental.session.compacting — return context string
+    return response.context ?? "";
+  }
+
+  formatSessionStartResponse(_response: SessionStartResponse): unknown {
+    // SessionStart not supported — should never be called
+    return undefined;
+  }
+
+  // ── Configuration ──────────────────────────────────────
+
+  getSettingsPath(): string {
+    // OpenCode uses opencode.json in the project root or .opencode/opencode.json
+    return resolve("opencode.json");
+  }
+
+  getSessionDir(): string {
+    const dir = join(homedir(), ".config", "opencode", "context-mode", "sessions");
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  getSessionDBPath(projectDir: string): string {
+    const hash = createHash("sha256")
+      .update(projectDir)
+      .digest("hex")
+      .slice(0, 16);
+    return join(this.getSessionDir(), `${hash}.db`);
+  }
+
+  getSessionEventsPath(projectDir: string): string {
+    const hash = createHash("sha256")
+      .update(projectDir)
+      .digest("hex")
+      .slice(0, 16);
+    return join(this.getSessionDir(), `${hash}-events.md`);
+  }
+
+  generateHookConfig(_pluginRoot: string): HookRegistration {
+    // OpenCode uses TS plugin paradigm — hooks are registered via plugin array
+    // in opencode.json, not via command-based hook entries.
+    // Return the hook name mapping for documentation purposes.
+    return {
+      [OPENCODE_HOOK_NAMES.BEFORE]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "plugin",
+              command: "context-mode",
+            },
+          ],
+        },
+      ],
+      [OPENCODE_HOOK_NAMES.AFTER]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "plugin",
+              command: "context-mode",
+            },
+          ],
+        },
+      ],
+      [OPENCODE_HOOK_NAMES.COMPACTING]: [
+        {
+          matcher: "",
+          hooks: [
+            {
+              type: "plugin",
+              command: "context-mode",
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  readSettings(): Record<string, unknown> | null {
+    // Try opencode.json, then .opencode/opencode.json
+    const paths = [
+      resolve("opencode.json"),
+      resolve(".opencode", "opencode.json"),
+    ];
+    for (const configPath of paths) {
+      try {
+        const raw = readFileSync(configPath, "utf-8");
+        return JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  writeSettings(settings: Record<string, unknown>): void {
+    // Write to opencode.json in current directory
+    const configPath = resolve("opencode.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify(settings, null, 2) + "\n",
+      "utf-8",
+    );
+  }
+
+  // ── Diagnostics (doctor) ─────────────────────────────────
+
+  validateHooks(_pluginRoot: string): DiagnosticResult[] {
+    const results: DiagnosticResult[] = [];
+    const settings = this.readSettings();
+
+    if (!settings) {
+      results.push({
+        check: "Plugin configuration",
+        status: "fail",
+        message: "Could not read opencode.json",
+        fix: "npx context-mode upgrade --platform opencode",
+      });
+      return results;
+    }
+
+    // Check for "context-mode" in plugin array
+    const plugins = settings.plugin as string[] | undefined;
+    if (plugins && Array.isArray(plugins)) {
+      const hasPlugin = plugins.some((p) => p.includes("context-mode"));
+      results.push({
+        check: "Plugin registration",
+        status: hasPlugin ? "pass" : "fail",
+        message: hasPlugin
+          ? "context-mode found in plugin array"
+          : "context-mode not found in plugin array",
+        fix: hasPlugin
+          ? undefined
+          : "npx context-mode upgrade --platform opencode",
+      });
+    } else {
+      results.push({
+        check: "Plugin registration",
+        status: "fail",
+        message: "No plugin array found in opencode.json",
+        fix: "npx context-mode upgrade --platform opencode",
+      });
+    }
+
+    // Warn about SessionStart limitation
+    results.push({
+      check: "SessionStart hook",
+      status: "warn",
+      message:
+        "SessionStart not supported in OpenCode (see issues #14808, #5409)",
+    });
+
+    return results;
+  }
+
+  checkPluginRegistration(): DiagnosticResult {
+    const settings = this.readSettings();
+    if (!settings) {
+      return {
+        check: "Plugin registration",
+        status: "warn",
+        message: "Could not read opencode.json",
+      };
+    }
+
+    const plugins = settings.plugin as string[] | undefined;
+    if (plugins && Array.isArray(plugins)) {
+      const hasPlugin = plugins.some((p) => p.includes("context-mode"));
+      if (hasPlugin) {
+        return {
+          check: "Plugin registration",
+          status: "pass",
+          message: "context-mode found in plugin array",
+        };
+      }
+    }
+
+    return {
+      check: "Plugin registration",
+      status: "fail",
+      message: "context-mode not found in opencode.json plugin array",
+      fix: "npx context-mode upgrade --platform opencode",
+    };
+  }
+
+  getInstalledVersion(): string {
+    // Check ~/.cache/opencode/node_modules/ for context-mode
+    try {
+      const pkgPath = resolve(
+        homedir(),
+        ".cache",
+        "opencode",
+        "node_modules",
+        "context-mode",
+        "package.json",
+      );
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+      if (typeof pkg.version === "string") return pkg.version;
+    } catch {
+      /* not found */
+    }
+    return "not installed";
+  }
+
+  // ── Upgrade ────────────────────────────────────────────
+
+  configureAllHooks(_pluginRoot: string): string[] {
+    const settings = this.readSettings() ?? {};
+    const changes: string[] = [];
+
+    // Add "context-mode" to the plugin array
+    const plugins = (settings.plugin ?? []) as string[];
+    if (!plugins.some((p) => p.includes("context-mode"))) {
+      plugins.push("context-mode");
+      changes.push("Added context-mode to plugin array");
+    } else {
+      changes.push("context-mode already in plugin array");
+    }
+
+    settings.plugin = plugins;
+    this.writeSettings(settings);
+    return changes;
+  }
+
+  backupSettings(): string | null {
+    const paths = [
+      resolve("opencode.json"),
+      resolve(".opencode", "opencode.json"),
+    ];
+    for (const configPath of paths) {
+      try {
+        accessSync(configPath, constants.R_OK);
+        const backupPath = configPath + ".bak";
+        copyFileSync(configPath, backupPath);
+        return backupPath;
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+
+  setHookPermissions(_pluginRoot: string): string[] {
+    // OpenCode uses TS plugin paradigm — no shell scripts to chmod
+    return [];
+  }
+
+  updatePluginRegistry(_pluginRoot: string, _version: string): void {
+    // OpenCode manages plugins through npm/opencode.json — no separate registry
+  }
+
+  // ── Routing Instructions (soft enforcement) ────────────
+
+  getRoutingInstructionsConfig(): RoutingInstructionsConfig {
+    return {
+      fileName: "AGENTS.md",
+      globalPath: resolve(homedir(), ".config", "opencode", "AGENTS.md"),
+      projectRelativePath: "AGENTS.md",
+    };
+  }
+
+  writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null {
+    const config = this.getRoutingInstructionsConfig();
+    const targetPath = resolve(projectDir, config.projectRelativePath);
+    const sourcePath = resolve(pluginRoot, "configs", "opencode", config.fileName);
+
+    try {
+      const content = readFileSync(sourcePath, "utf-8");
+
+      try {
+        const existing = readFileSync(targetPath, "utf-8");
+        if (existing.includes("context-mode")) return null;
+        writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
+        return targetPath;
+      } catch {
+        writeFileSync(targetPath, content, "utf-8");
+        return targetPath;
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  // ── Internal helpers ───────────────────────────────────
+
+  /**
+   * Extract session ID from OpenCode hook input.
+   * OpenCode uses camelCase sessionID.
+   */
+  private extractSessionId(input: OpenCodeHookInput): string {
+    if (input.sessionID) return input.sessionID;
+    return `pid-${process.ppid}`;
+  }
+}

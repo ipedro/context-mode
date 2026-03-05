@@ -218,4 +218,88 @@ export interface HookAdapter {
 
   /** Write platform settings. */
   writeSettings(settings: Record<string, unknown>): void;
+
+  // ── Diagnostics (doctor) ───────────────────────────────
+
+  /** Validate that hooks are properly configured for this platform. */
+  validateHooks(pluginRoot: string): DiagnosticResult[];
+
+  /** Check if the plugin is registered/enabled on this platform. */
+  checkPluginRegistration(): DiagnosticResult;
+
+  /** Get the installed version from this platform's registry/marketplace. */
+  getInstalledVersion(): string;
+
+  // ── Upgrade ────────────────────────────────────────────
+
+  /** Configure all hooks for this platform. Returns change descriptions. */
+  configureAllHooks(pluginRoot: string): string[];
+
+  /** Backup platform settings before modification. Returns backup path or null. */
+  backupSettings(): string | null;
+
+  /** Set executable permissions on hook scripts. Returns paths that were set. */
+  setHookPermissions(pluginRoot: string): string[];
+
+  /** Update platform's plugin registry to point to given path and version. */
+  updatePluginRegistry(pluginRoot: string, version: string): void;
+
+  // ── Routing Instructions (soft enforcement) ─────────────
+
+  /** Get the routing instructions file config for this platform. */
+  getRoutingInstructionsConfig(): RoutingInstructionsConfig;
+
+  /** Write routing instructions file to project directory if not present. Returns path written or null if already exists. */
+  writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null;
+}
+
+// ─────────────────────────────────────────────────────────
+// Diagnostic result
+// ─────────────────────────────────────────────────────────
+
+/** Configuration for platform-specific routing instruction files. */
+export interface RoutingInstructionsConfig {
+  /** File name the platform reads (e.g., "CLAUDE.md", "GEMINI.md", "AGENTS.md"). */
+  fileName: string;
+  /** Global path for this platform (e.g., "~/.claude/CLAUDE.md"). */
+  globalPath: string;
+  /** Project-level path relative to project root (e.g., "GEMINI.md", ".github/copilot-instructions.md"). */
+  projectRelativePath: string;
+}
+
+/** Result from a platform-specific diagnostic check. */
+export interface DiagnosticResult {
+  /** What was checked. */
+  check: string;
+  /** Pass, fail, or warning. */
+  status: "pass" | "fail" | "warn";
+  /** Human-readable message. */
+  message: string;
+  /** Suggested fix command (if applicable). */
+  fix?: string;
+}
+
+// ─────────────────────────────────────────────────────────
+// Platform detection
+// ─────────────────────────────────────────────────────────
+
+/** Supported platform identifiers. */
+export type PlatformId =
+  | "claude-code"
+  | "gemini-cli"
+  | "opencode"
+  | "codex"
+  | "copilot-cli"
+  | "vscode-copilot"
+  | "cursor"
+  | "unknown";
+
+/** Detection signal used to identify which platform is running. */
+export interface DetectionSignal {
+  /** Platform identifier. */
+  platform: PlatformId;
+  /** Confidence: env var match > config dir match > fallback. */
+  confidence: "high" | "medium" | "low";
+  /** How it was detected. */
+  reason: string;
 }

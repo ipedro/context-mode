@@ -1,0 +1,49 @@
+{
+  "description": "context-mode hooks for VS Code Copilot",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/vscode-copilot/pretooluse.mjs"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/vscode-copilot/posttooluse.mjs"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/vscode-copilot/precompact.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/vscode-copilot/sessionstart.mjs"
+          }
+        ]
+      }
+    ]
+  }
+}

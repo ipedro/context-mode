@@ -5,61 +5,212 @@
 [![users](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fclaude-context-mode%40main%2Fstats.json&query=%24.message&label=users&color=brightgreen)](https://www.npmjs.com/package/context-mode) [![npm](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fclaude-context-mode%40main%2Fstats.json&query=%24.npm&label=npm&color=blue)](https://www.npmjs.com/package/context-mode) [![marketplace](https://img.shields.io/badge/dynamic/json?url=https%3A%2F%2Fcdn.jsdelivr.net%2Fgh%2Fmksglu%2Fclaude-context-mode%40main%2Fstats.json&query=%24.marketplace&label=marketplace&color=blue)](https://github.com/mksglu/claude-context-mode) [![GitHub stars](https://img.shields.io/github/stars/mksglu/claude-context-mode?style=flat&color=yellow)](https://github.com/mksglu/claude-context-mode/stargazers) [![GitHub forks](https://img.shields.io/github/forks/mksglu/claude-context-mode?style=flat&color=blue)](https://github.com/mksglu/claude-context-mode/network/members) [![Last commit](https://img.shields.io/github/last-commit/mksglu/claude-context-mode?color=green)](https://github.com/mksglu/claude-context-mode/commits) [![License: ELv2](https://img.shields.io/badge/License-ELv2-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/discord/1478479412700909750?label=Discord&logo=discord&color=5865f2)](https://discord.gg/DCN9jUgN5v)
 
-Every MCP tool call in Claude Code dumps raw data into your 200K context window. A Playwright snapshot costs 56 KB. Twenty GitHub issues cost 59 KB. One access log — 45 KB. After 30 minutes, 40% of your context is gone.
+Context Mode is an MCP server that solves both halves of the context problem:
 
-Inspired by Cloudflare's [Code Mode](https://blog.cloudflare.com/code-mode-mcp/) — which compresses tool definitions from millions of tokens into ~1,000 — we asked: what about the other direction?
-
-Context Mode is an MCP server that sits between Claude Code and these outputs. **315 KB becomes 5.4 KB. 98% reduction.**
+1. **Context Saving** — Sandbox tools keep raw data out of the context window. 315 KB becomes 5.4 KB. 98% reduction.
+2. **Session Continuity** — Every file edit, git operation, task, error, and user decision is tracked in SQLite. When the conversation compacts, context-mode doesn't dump this data back into context — it indexes events into FTS5 and retrieves only what's relevant via BM25 search. The model picks up exactly where you left off. If you don't `--continue`, session data is automatically cleaned up after 7 days.
 
 https://github.com/user-attachments/assets/07013dbf-07c0-4ef1-974a-33ea1207637b
 
 ## Install
+
+<details open>
+<summary><strong>Claude Code</strong></summary>
+
+**Step 1 — Install the plugin:**
 
 ```bash
 /plugin marketplace add mksglu/claude-context-mode
 /plugin install context-mode@claude-context-mode
 ```
 
-Restart Claude Code. Done. This installs the MCP server + a PreToolUse hook that automatically routes tool outputs through the sandbox + slash commands for diagnostics and upgrades.
+**Step 2 — Restart Claude Code.**
+
+That's it. The plugin installs everything automatically:
+- MCP server with 6 sandbox tools (`batch_execute`, `execute`, `execute_file`, `index`, `search`, `fetch_and_index`)
+- PreToolUse hooks that intercept Bash, Read, WebFetch, Grep, and Task calls — nudging them toward sandbox execution
+- PostToolUse, PreCompact, and SessionStart hooks for session tracking and context injection
+- A `CLAUDE.md` routing instructions file auto-created in your project root
+- Slash commands for diagnostics and upgrades (Claude Code only)
 
 | Command | What it does |
 |---|---|
-| `/context-mode:ctx-stats` | Show context savings for the current session — per-tool breakdown, tokens consumed, savings ratio. |
-| `/context-mode:ctx-doctor` | Run diagnostics — checks runtimes, hooks, FTS5, plugin registration, npm and marketplace versions. |
-| `/context-mode:ctx-upgrade` | Pull latest from GitHub, rebuild, migrate cache, fix hooks. |
+| `/context-mode:ctx-stats` | Context savings — per-tool breakdown, tokens consumed, savings ratio. |
+| `/context-mode:ctx-doctor` | Diagnostics — runtimes, hooks, FTS5, plugin registration, versions. |
+| `/context-mode:ctx-upgrade` | Pull latest, rebuild, migrate cache, fix hooks. |
 
-<details>
-<summary><strong>MCP-only install</strong> (no hooks or slash commands)</summary>
+> **Note:** Slash commands are a Claude Code plugin feature. On other platforms, use the `stats` MCP tool directly — it works on all platforms. Ask the model: *"Show my context-mode stats"* or *"Call the stats tool"*.
+
+**Alternative — MCP-only install** (no hooks or slash commands):
 
 ```bash
 claude mcp add context-mode -- npx -y context-mode
 ```
 
+This gives you the 6 sandbox tools but without automatic routing. The model can still use them — it just won't be nudged to prefer them over raw Bash/Read/WebFetch. Good for trying it out before committing to the full plugin.
+
 </details>
 
 <details>
-<summary><strong>Local development</strong></summary>
+<summary><strong>Gemini CLI</strong></summary>
 
-```bash
-claude --plugin-dir ./path/to/context-mode
+**Step 1 — Register the MCP server.** Add to `~/.gemini/settings.json`:
+
+```json
+{
+  "mcpServers": {
+    "context-mode": {
+      "command": "npx",
+      "args": ["-y", "context-mode"]
+    }
+  }
+}
 ```
+
+**Step 2 — Add hooks.** Without hooks, the model can ignore routing instructions and dump raw output into your context window. Hooks intercept every tool call and enforce sandbox routing programmatically — blocking `curl`, `wget`, and other data-heavy commands before they execute. Add to the same `~/.gemini/settings.json`:
+
+```json
+{
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/gemini-cli/beforetool.mjs" }]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/gemini-cli/aftertool.mjs" }]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/gemini-cli/sessionstart.mjs" }]
+      }
+    ]
+  }
+}
+```
+
+**Step 3 — Restart Gemini CLI.** On first run, a `GEMINI.md` routing instructions file is auto-created in your project root. This works alongside hooks as a parallel enforcement layer — hooks block dangerous commands programmatically, while `GEMINI.md` teaches the model to prefer sandbox tools from the start.
+
+> **Why hooks matter:** Without hooks, context-mode relies on `GEMINI.md` instructions alone (~60% compliance). The model sometimes follows them, but regularly runs raw `curl`, reads large files directly, or dumps unprocessed output into context — a single unrouted Playwright snapshot (56 KB) wipes out an entire session's savings. With hooks, every tool call is intercepted before execution — dangerous commands are blocked, and routing guidance is injected in real-time. This is the difference between ~60% and ~98% context savings.
+
+Full hook config including PreCompress: [`configs/gemini-cli/settings.json`](configs/gemini-cli/settings.json)
 
 </details>
 
-## The Problem
+<details>
+<summary><strong>VS Code Copilot</strong></summary>
 
-MCP has become the standard way for AI agents to use external tools. But there is a tension at its core: every tool interaction fills the context window from both sides — definitions on the way in, raw output on the way out.
+**Step 1 — Register the MCP server.** Create `.vscode/mcp.json` in your project root:
 
-With [81+ tools active, 143K tokens (72%) get consumed before your first message](https://scottspence.com/posts/optimising-mcp-server-context-usage-in-claude-code). And then the tools start returning data. A single Playwright snapshot burns 56 KB. A `gh issue list` dumps 59 KB. Run a test suite, read a log file, fetch documentation — each response eats into what remains.
+```json
+{
+  "servers": {
+    "context-mode": {
+      "command": "npx",
+      "args": ["-y", "context-mode"]
+    }
+  }
+}
+```
 
-Code Mode showed that tool definitions can be compressed by 99.9%. Context Mode applies the same principle to tool outputs — processing them in sandboxes so only summaries reach the model.
+**Step 2 — Add hooks.** Without hooks, the model can bypass routing and dump raw output into your context. Hooks intercept every tool call and enforce sandbox routing programmatically. Create `.github/hooks/context-mode.json`:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/vscode-copilot/pretooluse.mjs" }]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/vscode-copilot/posttooluse.mjs" }]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [{ "type": "command", "command": "node ./node_modules/context-mode/hooks/vscode-copilot/sessionstart.mjs" }]
+      }
+    ]
+  }
+}
+```
+
+**Step 3 — Restart VS Code.** On first run, a `.github/copilot-instructions.md` routing instructions file is auto-created in your project. This works alongside hooks as a parallel enforcement layer — hooks intercept tool calls programmatically, while `copilot-instructions.md` guides the model's tool selection from session start.
+
+> **Why hooks matter:** Without hooks, `copilot-instructions.md` guides the model but can't block commands. A single unrouted Playwright snapshot (56 KB) or `gh issue list` (59 KB) wipes out minutes of context savings. With hooks, these calls are intercepted and redirected to the sandbox before they execute.
+
+Full hook config including PreCompact: [`configs/vscode-copilot/hooks.json`](configs/vscode-copilot/hooks.json)
+
+</details>
+
+<details>
+<summary><strong>OpenCode</strong></summary>
+
+**Step 1 — Register the MCP server and plugin.** OpenCode uses a TypeScript plugin paradigm instead of JSON hooks. Add both the MCP server and the plugin to `opencode.json` in your project root:
+
+```json
+{
+  "mcp": {
+    "context-mode": {
+      "command": "npx",
+      "args": ["-y", "context-mode"]
+    }
+  },
+  "plugin": ["context-mode"]
+}
+```
+
+The `mcp` entry gives you the 6 sandbox tools. The `plugin` entry enables hooks — OpenCode calls the plugin's TypeScript functions directly before and after each tool execution, blocking dangerous commands (like raw `curl`) and enforcing sandbox routing.
+
+**Step 2 — Restart OpenCode.** On first run, an `AGENTS.md` routing instructions file is auto-created in your project root. This works alongside the plugin as a parallel enforcement layer — the plugin intercepts tool calls at runtime, while `AGENTS.md` guides the model's tool preferences from session start.
+
+> **Why the plugin matters:** Without the `plugin` entry, context-mode has no way to intercept tool calls. The model can run raw `curl`, read large files directly, or dump unprocessed output into context — ignoring `AGENTS.md` instructions. With the plugin, `tool.execute.before` fires on every tool call and blocks or redirects data-heavy commands before they execute.
+>
+> Note: OpenCode's SessionStart hook is not yet available ([#14808](https://github.com/sst/opencode/issues/14808)), so the `AGENTS.md` file is the primary way context-mode instructions reach the model at session start. The plugin handles everything after that.
+
+</details>
+
+<details>
+<summary><strong>Codex CLI</strong></summary>
+
+**Step 1 — Register the MCP server.** Add to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.context-mode]
+command = "npx"
+args = ["-y", "context-mode"]
+```
+
+**Step 2 — Restart Codex CLI.** On first run, an `AGENTS.md` routing instructions file is auto-created in your project root. Codex CLI reads `AGENTS.md` automatically and learns to prefer context-mode sandbox tools.
+
+**About hooks:** Codex CLI does not support hooks — PRs [#2904](https://github.com/openai/codex/pull/2904) and [#9796](https://github.com/openai/codex/pull/9796) were closed without merge. The `AGENTS.md` routing instructions file is the only enforcement method (~60% compliance). The model receives the instructions at session start and sometimes follows them, but there is no programmatic interception — it can run raw `curl`, read large files, or bypass sandbox tools at any time.
+
+For stronger enforcement, you can also add the instructions globally:
+
+```bash
+cp ~/.codex/AGENTS.md  # auto-created, or copy from node_modules/context-mode/configs/codex/AGENTS.md
+```
+
+Global `~/.codex/AGENTS.md` applies to all projects. Project-level `./AGENTS.md` applies to the current project only. If both exist, Codex CLI merges them.
+
+</details>
 
 ## Tools
 
 | Tool | What it does | Context saved |
 |---|---|---|
 | `batch_execute` | Run multiple commands + search multiple queries in ONE call. | 986 KB → 62 KB |
-| `execute` | Run code in 10 languages. Only stdout enters context. | 56 KB → 299 B |
+| `execute` | Run code in 11 languages. Only stdout enters context. | 56 KB → 299 B |
 | `execute_file` | Process files in sandbox. Raw content never leaves. | 45 KB → 155 B |
 | `index` | Chunk markdown into FTS5 with BM25 ranking. | 60 KB → 40 B |
 | `search` | Query indexed content with multiple queries in one call. | On-demand retrieval |
@@ -81,7 +232,7 @@ The `index` tool chunks markdown content by headings while keeping code blocks i
 
 When you call `search`, it returns relevant content snippets focused around matching query terms — not full documents, not approximations, the actual indexed content with smart extraction around what you're looking for. `fetch_and_index` extends this to URLs: fetch, convert HTML to markdown, chunk, index. The raw page never enters context.
 
-## Fuzzy Search
+### Fuzzy Search
 
 Search uses a three-layer fallback to handle typos, partial terms, and substring matches:
 
@@ -89,65 +240,99 @@ Search uses a three-layer fallback to handle typos, partial terms, and substring
 - **Layer 2 — Trigram substring**: FTS5 trigram tokenizer matches partial strings. "useEff" finds "useEffect", "authenticat" finds "authentication".
 - **Layer 3 — Fuzzy correction**: Levenshtein distance corrects typos before re-searching. "kuberntes" → "kubernetes", "autentication" → "authentication".
 
-The `searchWithFallback` method cascades through all three layers and annotates results with `matchLayer` so you know which layer resolved the query.
+### Smart Snippets
 
-## Smart Snippets
+Search results use intelligent extraction instead of truncation. Instead of returning the first N characters (which might miss the important part), Context Mode finds where your query terms appear in the content and returns windows around those matches.
 
-Search results use intelligent extraction instead of truncation. Instead of returning the first N characters (which might miss the important part), Context Mode finds where your query terms appear in the content and returns windows around those matches. If your query is "authentication JWT token", you get the paragraphs where those terms actually appear — not an arbitrary prefix.
-
-## Progressive Search Throttling
-
-The `search` tool includes progressive throttling to prevent context flooding from excessive individual calls:
+### Progressive Throttling
 
 - **Calls 1-3:** Normal results (2 per query)
 - **Calls 4-8:** Reduced results (1 per query) + warning
 - **Calls 9+:** Blocked — redirects to `batch_execute`
 
-This encourages batching queries via `search(queries: ["q1", "q2", "q3"])` or `batch_execute` instead of making dozens of individual calls.
+## Session Continuity
 
-## Session Stats
+When the context window fills up, the agent compacts the conversation — dropping older messages to make room. Without session tracking, the model forgets which files it was editing, what tasks are in progress, what errors were resolved, and what you last asked for.
 
-The `stats` tool tracks context consumption in real-time. Network I/O inside the sandbox is automatically tracked for JS/TS executions.
+Context Mode captures every meaningful event during your session and persists them in a per-project SQLite database. When the conversation compacts (or you resume with `--continue`), your working state is rebuilt automatically — the model continues from your last prompt without asking you to repeat anything.
 
-| Metric | Value |
-|---|---|
-| Session | 1.4 min |
-| Tool calls | 1 |
-| Total data processed | **9.6MB** |
-| Kept in sandbox | **9.6MB** |
-| Entered context | 0.3KB |
-| Tokens consumed | ~82 |
-| **Context savings** | **24,576.0x (99% reduction)** |
+Session continuity requires 4 hooks working together:
 
-| Tool | Calls | Context | Tokens |
+| Hook | Role | Claude Code | Gemini CLI | VS Code Copilot | OpenCode | Codex CLI |
+|---|---|:---:|:---:|:---:|:---:|:---:|
+| **PostToolUse** | Captures events after each tool call | Yes | Yes | Yes | Yes | -- |
+| **UserPromptSubmit** | Captures user decisions and corrections | Yes | -- | -- | -- | -- |
+| **PreCompact** | Builds snapshot before compaction | Yes | Yes | Yes | -- | -- |
+| **SessionStart** | Restores state after compaction | Yes | Yes | Yes | -- | -- |
+| | **Session completeness** | **Full** | **High** | **High** | **Partial** | **--** |
+
+> **Note:** Full session continuity (capture + snapshot + restore) works on **Claude Code**, **Gemini CLI**, and **VS Code Copilot**. OpenCode captures events but cannot yet restore them after compaction (SessionStart not available — [#14808](https://github.com/sst/opencode/issues/14808)). Codex CLI has no hook support, so session tracking is not available.
+
+<details>
+<summary><strong>What gets captured</strong></summary>
+
+Every tool call passes through hooks that extract structured events:
+
+| Category | Events | Priority | Captured By |
 |---|---|---|---|
-| execute | 1 | 0.3KB | ~82 |
-| **Total** | **1** | **0.3KB** | **~82** |
+| **Files** | read, edit, write, glob, grep | Critical (P1) | PostToolUse |
+| **Tasks** | create, update, complete | Critical (P1) | PostToolUse |
+| **Rules** | CLAUDE.md / GEMINI.md / AGENTS.md paths + content | Critical (P1) | SessionStart |
+| **Decisions** | User corrections, preferences ("use X instead", "don't do Y") | High (P2) | UserPromptSubmit |
+| **Git** | checkout, commit, merge, rebase, stash, push, pull, diff, status | High (P2) | PostToolUse |
+| **Errors** | Tool failures, non-zero exit codes | High (P2) | PostToolUse |
+| **Environment** | cwd changes, venv, nvm, conda, package installs | High (P2) | PostToolUse |
+| **MCP Tools** | All `mcp__*` tool calls with usage counts | Normal (P3) | PostToolUse |
+| **Subagents** | Agent tool invocations | Normal (P3) | PostToolUse |
+| **Skills** | Slash command invocations | Normal (P3) | PostToolUse |
+| **Intent** | Session mode classification (investigate, implement, debug) | Low (P4) | UserPromptSubmit |
+| **User Prompts** | Every user message (for last-prompt restore) | Critical (P1) | UserPromptSubmit |
 
-> Without context-mode, **9.6MB** of raw tool output would flood your context window. Instead, **9.6MB** (99%) stayed in sandbox — saving **~2,457,600 tokens** of context space.
+</details>
 
-## Subagent Routing
+<details>
+<summary><strong>How sessions survive compaction</strong></summary>
 
-When installed as a plugin, Context Mode includes a PreToolUse hook that automatically injects routing instructions into subagent (Task tool) prompts. Subagents learn to use `batch_execute` as their primary tool and `search(queries: [...])` for follow-ups — without any manual configuration.
+```
+PreCompact fires
+  → Read all session events from SQLite
+  → Build priority-tiered XML snapshot (≤2 KB)
+  → Store snapshot in session_resume table
 
-Bash subagents are automatically upgraded to `general-purpose` so they can access MCP tools. Without this, a `subagent_type: "Bash"` agent only has the Bash tool — it can't call `batch_execute` or `search`, and all raw output floods context.
+SessionStart fires (source: "compact")
+  → Retrieve stored snapshot
+  → Write structured events file → auto-indexed into FTS5
+  → Inject <session_knowledge> directive into context
+  → Model calls search() on session index
+  → Model displays summary table + continues from last user prompt
+```
 
-## The Numbers
+The snapshot is built in priority tiers — if the 2 KB budget is tight, lower-priority events (intent, MCP tool counts) are dropped first while critical state (active files, tasks, rules, decisions) is always preserved.
 
-Measured across real-world scenarios:
+After compaction, the model receives:
+- **Active files** — last 10 files with operation counts (read:3, edit:2, write:1)
+- **Task state** — current task list with statuses
+- **Project rules** — CLAUDE.md / GEMINI.md / AGENTS.md content
+- **User decisions** — corrections and preferences from the conversation
+- **Environment** — current working directory, git branch, active tools
+- **Last user prompt** — so the model continues without asking "what were we doing?"
 
-**Playwright snapshot** — 56.2 KB raw → 299 B context (99% saved)
-**GitHub Issues (20)** — 58.9 KB raw → 1.1 KB context (98% saved)
-**Access log (500 requests)** — 45.1 KB raw → 155 B context (100% saved)
-**Context7 React docs** — 5.9 KB raw → 261 B context (96% saved)
-**Analytics CSV (500 rows)** — 85.5 KB raw → 222 B context (100% saved)
-**Git log (153 commits)** — 11.6 KB raw → 107 B context (99% saved)
-**Test output (30 suites)** — 6.0 KB raw → 337 B context (95% saved)
-**Repo research (subagent)** — 986 KB raw → 62 KB context (94% saved, 5 calls vs 37)
+</details>
 
-Over a full session: 315 KB of raw output becomes 5.4 KB. Session time before slowdown goes from ~30 minutes to ~3 hours. Context remaining after 45 minutes: 99% instead of 60%.
+<details>
+<summary><strong>Per-platform details</strong></summary>
 
-[Full benchmark data with 21 scenarios →](BENCHMARK.md)
+**Claude Code** — Full session support. All 5 hook types fire, capturing tool events, user decisions, building compaction snapshots, and restoring state after compaction or `--continue`.
+
+**Gemini CLI** — High coverage. PostToolUse (AfterTool), PreCompact (PreCompress), and SessionStart all fire. Missing UserPromptSubmit, so user decisions and corrections aren't captured — but file edits, git ops, errors, and tasks are fully tracked.
+
+**VS Code Copilot** — High coverage. Same as Gemini CLI — PostToolUse, PreCompact, and SessionStart all fire. User decisions aren't captured but all tool-level events are.
+
+**OpenCode** — Partial. The TypeScript plugin captures PostToolUse events via `tool.execute.after`, but SessionStart is not yet available ([#14808](https://github.com/sst/opencode/issues/14808)). Events are stored but not automatically restored after compaction. The `AGENTS.md` routing instructions file compensates by re-teaching tool preferences at each session start.
+
+**Codex CLI** — No session support. No hooks means no event capture. Each compaction or new session starts fresh. The `AGENTS.md` routing instructions file is the only continuity mechanism.
+
+</details>
 
 ## Try It
 
@@ -185,25 +370,28 @@ Fetch the React useEffect docs, index them, and find the cleanup pattern
 with code examples. Then run /context-mode:ctx-stats.
 ```
 
+## Benchmarks
+
+| Scenario | Raw | Context | Saved |
+|---|---|---|---|
+| Playwright snapshot | 56.2 KB | 299 B | 99% |
+| GitHub Issues (20) | 58.9 KB | 1.1 KB | 98% |
+| Access log (500 requests) | 45.1 KB | 155 B | 100% |
+| Context7 React docs | 5.9 KB | 261 B | 96% |
+| Analytics CSV (500 rows) | 85.5 KB | 222 B | 100% |
+| Git log (153 commits) | 11.6 KB | 107 B | 99% |
+| Test output (30 suites) | 6.0 KB | 337 B | 95% |
+| Repo research (subagent) | 986 KB | 62 KB | 94% |
+
+Over a full session: 315 KB of raw output becomes 5.4 KB. Session time extends from ~30 minutes to ~3 hours.
+
+[Full benchmark data with 21 scenarios →](BENCHMARK.md)
+
 ## Security
 
-Context Mode enforces the same permission rules you already use in Claude Code — but extends them to the MCP sandbox. If you block `sudo` in Claude Code, it's also blocked inside `execute`, `execute_file`, and `batch_execute`.
+Context Mode enforces the same permission rules you already use — but extends them to the MCP sandbox. If you block `sudo`, it's also blocked inside `execute`, `execute_file`, and `batch_execute`.
 
 **Zero setup required.** If you haven't configured any permissions, nothing changes. This only activates when you add rules.
-
-### Getting started
-
-Find your settings file:
-
-```bash
-# macOS / Linux
-cat ~/.claude/settings.json
-
-# Windows
-type %USERPROFILE%\.claude\settings.json
-```
-
-Add a `permissions` section (keep your existing settings, just add this block). Then restart Claude Code.
 
 ```json
 {
@@ -224,106 +412,46 @@ Add a `permissions` section (keep your existing settings, just add this block). 
 
 The pattern is `Tool(what to match)` where `*` means "anything".
 
-<details>
-<summary><strong>Common deny patterns</strong> (click to expand)</summary>
-
-**Dangerous commands:**
-```
-"Bash(sudo *)"              — block all sudo commands
-"Bash(rm -rf /*)"           — block recursive delete from root
-"Bash(chmod 777 *)"         — block open permissions
-"Bash(shutdown *)"          — block shutdown/reboot
-"Bash(kill -9 *)"           — block force kill
-"Bash(mkfs *)"              — block filesystem format
-"Bash(dd *)"                — block disk write
-```
-
-**Network access:**
-```
-"Bash(curl *)"              — block curl
-"Bash(wget *)"              — block wget
-"Bash(ssh *)"               — block ssh connections
-"Bash(scp *)"               — block secure copy
-"Bash(nc *)"                — block netcat
-```
-
-**Package managers and deploys:**
-```
-"Bash(npm publish *)"       — block npm publish
-"Bash(docker push *)"       — block docker push
-"Bash(pip install *)"       — block pip install
-"Bash(brew install *)"      — block brew install
-"Bash(apt install *)"       — block apt install
-"Bash(wrangler deploy *)"   — block Cloudflare deploys
-"Bash(terraform apply *)"   — block terraform apply
-"Bash(kubectl delete *)"    — block k8s delete
-```
-
-**Sensitive files:**
-```
-"Read(.env)"                — block .env in project root
-"Read(**/.env*)"            — block .env files everywhere
-"Read(**/*secret*)"         — block files with "secret" in the name
-"Read(**/*credential*)"     — block credential files
-"Read(**/*.pem)"            — block private keys
-"Read(**/*id_rsa*)"         — block SSH keys
-```
-
-</details>
-
-<details>
-<summary><strong>Common allow patterns</strong> (click to expand)</summary>
-
-```
-"Bash(git:*)"               — allow git (with or without args)
-"Bash(npm:*)"               — allow npm
-"Bash(npx:*)"               — allow npx
-"Bash(node:*)"              — allow node
-"Bash(python:*)"            — allow python
-"Bash(ls:*)"                — allow ls
-"Bash(cat:*)"               — allow cat
-"Bash(echo:*)"              — allow echo
-"Bash(grep:*)"              — allow grep
-"Bash(make:*)"              — allow make
-```
-
-</details>
-
-### Chained commands
-
-Commands chained with `&&`, `;`, or `|` are split — each part is checked separately:
-
-```
-echo hello && sudo rm -rf /tmp
-```
-
-Blocked. Even though it starts with `echo`, the `sudo` part matches the deny rule.
-
-### Where to put rules
-
-Rules can go in three places (checked in this order):
-
-1. `.claude/settings.local.json` — this project only (gitignored)
-2. `.claude/settings.json` — this project, shared with team
-3. `~/.claude/settings.json` — all projects
+Commands chained with `&&`, `;`, or `|` are split — each part is checked separately. `echo hello && sudo rm -rf /tmp` is blocked because the `sudo` part matches the deny rule.
 
 **deny** always wins over **allow**. More specific (project-level) rules override global ones.
 
-## Requirements
+## Platform Compatibility
 
-- **Node.js 18+**
-- **Claude Code** with MCP support
-- Optional: Bun (auto-detected, 3-5x faster JS/TS)
+| Feature | Claude Code | Gemini CLI | VS Code Copilot | OpenCode | Codex CLI |
+|---|:---:|:---:|:---:|:---:|:---:|
+| MCP Server | Yes | Yes | Yes | Yes | Yes |
+| PreToolUse Hook | Yes | Yes | Yes | Yes | -- |
+| PostToolUse Hook | Yes | Yes | Yes | Yes | -- |
+| SessionStart Hook | Yes | Yes | Yes | -- | -- |
+| Can Modify Args | Yes | Yes | Yes | Yes | -- |
+| Can Block Tools | Yes | Yes | Yes | Yes | -- |
+| Slash Commands | Yes | -- | -- | -- | -- |
+| Plugin Marketplace | Yes | -- | -- | -- | -- |
+
+### Routing Enforcement
+
+Hooks intercept tool calls programmatically — they can block dangerous commands and redirect them to the sandbox before execution. Instruction files guide the model via prompt instructions but cannot block anything. **Always enable hooks where supported.**
+
+| Platform | Hooks | Instruction File | With Hooks | Without Hooks |
+|---|:---:|---|:---:|:---:|
+| Claude Code | Yes (auto) | [`CLAUDE.md`](configs/claude-code/CLAUDE.md) | **~98% saved** | ~60% saved |
+| Gemini CLI | Yes | [`GEMINI.md`](configs/gemini-cli/GEMINI.md) | **~98% saved** | ~60% saved |
+| VS Code Copilot | Yes | [`copilot-instructions.md`](configs/vscode-copilot/copilot-instructions.md) | **~98% saved** | ~60% saved |
+| OpenCode | Partial (plugin) | [`AGENTS.md`](configs/opencode/AGENTS.md) | **~95% saved** | ~60% saved |
+| Codex CLI | -- | [`AGENTS.md`](configs/codex/AGENTS.md) | -- | ~60% saved |
+
+Without hooks, one unrouted `curl` or Playwright snapshot can dump 56 KB into context — wiping out an entire session's worth of savings.
+
+See [`docs/platform-support.md`](docs/platform-support.md) for the full capability comparison.
 
 ## Contributing
 
-We welcome contributions! See [CONTRIBUTING.md](CONTRIBUTING.md) for the full local development workflow, TDD guidelines, and how to test your changes in a live Claude Code session.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and TDD guidelines.
 
 ```bash
 git clone https://github.com/mksglu/claude-context-mode.git
-cd claude-context-mode && npm install
-npm test              # run tests
-npm run test:all      # full suite
+cd claude-context-mode && npm install && npm test
 ```
 
 ## Contributors

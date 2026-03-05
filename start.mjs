@@ -12,6 +12,53 @@ if (!process.env.CLAUDE_PROJECT_DIR) {
   process.env.CLAUDE_PROJECT_DIR = process.cwd();
 }
 
+// Auto-write routing instructions file for the detected platform
+try {
+  const projectDir =
+    process.env.CLAUDE_PROJECT_DIR ||
+    process.env.GEMINI_PROJECT_DIR ||
+    process.env.VSCODE_CWD ||
+    process.cwd();
+
+  const configsDir = resolve(__dirname, "configs");
+
+  // Detect platform and determine instruction file
+  const platformConfigs = [
+    { env: ["CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"], dir: "claude-code", file: "CLAUDE.md", target: "CLAUDE.md" },
+    { env: ["GEMINI_PROJECT_DIR", "GEMINI_SESSION_ID"], dir: "gemini-cli", file: "GEMINI.md", target: "GEMINI.md" },
+    { env: ["VSCODE_PID", "VSCODE_CWD"], dir: "vscode-copilot", file: "copilot-instructions.md", target: ".github/copilot-instructions.md" },
+    { env: ["OPENCODE_PROJECT_DIR", "OPENCODE_SESSION_ID"], dir: "opencode", file: "AGENTS.md", target: "AGENTS.md" },
+    { env: ["CODEX_HOME"], dir: "codex", file: "AGENTS.md", target: "AGENTS.md" },
+  ];
+
+  const detected = platformConfigs.find((p) => p.env.some((e) => process.env[e]));
+  if (detected) {
+    const targetPath = resolve(projectDir, detected.target);
+    const sourcePath = resolve(configsDir, detected.dir, detected.file);
+
+    // Ensure parent dir exists (for .github/copilot-instructions.md)
+    const targetDir = resolve(targetPath, "..");
+    if (!existsSync(targetDir)) {
+      const { mkdirSync } = await import("node:fs");
+      mkdirSync(targetDir, { recursive: true });
+    }
+
+    if (existsSync(sourcePath)) {
+      const content = readFileSync(sourcePath, "utf-8");
+      if (existsSync(targetPath)) {
+        const existing = readFileSync(targetPath, "utf-8");
+        if (!existing.includes("context-mode")) {
+          writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
+        }
+      } else {
+        writeFileSync(targetPath, content, "utf-8");
+      }
+    }
+  }
+} catch {
+  /* best effort — don't block server startup */
+}
+
 // Self-heal: if a newer version dir exists, update registry so next session uses it
 const cacheMatch = __dirname.match(
   /^(.*[\/\\]plugins[\/\\]cache[\/\\][^\/\\]+[\/\\][^\/\\]+[\/\\])([^\/\\]+)$/,

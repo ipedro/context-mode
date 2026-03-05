@@ -1,30 +1,22 @@
 #!/usr/bin/env node
 /**
- * Unified PreToolUse hook for context-mode
+ * Unified PreToolUse hook for context-mode (Claude Code)
  * Redirects data-fetching tools to context-mode MCP tools
  *
  * Cross-platform (Windows/macOS/Linux) — no bash/jq dependency.
  *
- * Routing is structured as a pure function that returns a response object
- * (or null for passthrough). This avoids process.exit() which drops piped
- * stdout on Windows before the buffer is flushed.
+ * Routing is delegated to core/routing.mjs (shared across platforms).
+ * This file retains the Claude Code-specific self-heal block and
+ * uses core/formatters.mjs for Claude Code output format.
  */
 
-import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, readdirSync, statSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, rmSync, mkdirSync, copyFileSync, readdirSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import { homedir, tmpdir } from "node:os";
-import { ROUTING_BLOCK, READ_GUIDANCE, GREP_GUIDANCE } from "./routing-block.mjs";
-
-// ─── Security module: graceful import from compiled build ───
-let security = null;
-try {
-  const __hookDir = dirname(fileURLToPath(import.meta.url));
-  const secPath = resolve(__hookDir, "..", "build", "security.js");
-  security = await import(pathToFileURL(secPath).href);
-} catch {
-  // Build not available — skip security checks, rely on existing routing
-}
+import { readStdin } from "./core/stdin.mjs";
+import { routePreToolUse, initSecurity } from "./core/routing.mjs";
+import { formatDecision } from "./core/formatters.mjs";
 
 // ─── Manual recursive copy (avoids cpSync libuv crash on non-ASCII paths, Windows + Node 24) ───
 function copyDirSync(src, dest) {
@@ -125,259 +117,19 @@ try {
   }
 } catch { /* best effort — don't block hook */ }
 
-// Event-based flowing mode avoids two platform bugs:
-// - `for await (process.stdin)` hangs on macOS when piped via spawnSync
-// - `readFileSync(0)` throws EOF/EISDIR on Windows, EAGAIN on Linux
-const raw = await new Promise((resolve, reject) => {
-  let data = "";
-  process.stdin.setEncoding("utf-8");
-  process.stdin.on("data", (chunk) => { data += chunk; });
-  process.stdin.on("end", () => resolve(data));
-  process.stdin.on("error", reject);
-  process.stdin.resume();
-});
+// ─── Init security from compiled build ───
+const __hookDir = dirname(fileURLToPath(import.meta.url));
+await initSecurity(resolve(__hookDir, "..", "build"));
 
+// ─── Read stdin ───
+const raw = await readStdin();
 const input = JSON.parse(raw);
 const tool = input.tool_name ?? "";
 const toolInput = input.tool_input ?? {};
 
-// ─── Route tool to appropriate response ───
-// Returns a response object, or null for passthrough.
-function route() {
-  // ─── Bash: Stage 1 security check, then Stage 2 routing ───
-  if (tool === "Bash") {
-    const command = toolInput.command ?? "";
-
-    // Stage 1: Security check against user's deny/allow patterns.
-    // Only act when an explicit pattern matched. When no pattern matches,
-    // evaluateCommand returns { decision: "ask" } with no matchedPattern —
-    // in that case fall through so other hooks and Claude Code's native engine can decide.
-    if (security) {
-      const policies = security.readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-      if (policies.length > 0) {
-        const result = security.evaluateCommand(command, policies);
-        if (result.decision === "deny") {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              reason: `Blocked by security policy: matches deny pattern ${result.matchedPattern}`,
-            },
-          };
-        }
-        if (result.decision === "ask" && result.matchedPattern) {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "ask",
-            },
-          };
-        }
-        // "allow" or no match → fall through to Stage 2
-      }
-    }
-
-    // Stage 2: Context-mode routing (existing behavior)
-
-    // curl/wget → replace with echo redirect
-    if (/(^|\s|&&|\||\;)(curl|wget)\s/i.test(command)) {
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          updatedInput: {
-            command: 'echo "context-mode: curl/wget blocked. You MUST use mcp__plugin_context-mode_context-mode__fetch_and_index(url, source) to fetch URLs, or mcp__plugin_context-mode_context-mode__execute(language, code) to run HTTP calls in sandbox. Do NOT retry with curl/wget."',
-          },
-        },
-      };
-    }
-
-    // inline fetch (node -e, python -c, etc.) → replace with echo redirect
-    if (
-      /fetch\s*\(\s*['"](https?:\/\/|http)/i.test(command) ||
-      /requests\.(get|post|put)\s*\(/i.test(command) ||
-      /http\.(get|request)\s*\(/i.test(command)
-    ) {
-      return {
-        hookSpecificOutput: {
-          hookEventName: "PreToolUse",
-          updatedInput: {
-            command: 'echo "context-mode: Inline HTTP blocked. Use mcp__plugin_context-mode_context-mode__execute(language, code) to run HTTP calls in sandbox, or mcp__plugin_context-mode_context-mode__fetch_and_index(url, source) for web pages. Do NOT retry with Bash."',
-          },
-        },
-      };
-    }
-
-    // allow all other Bash commands
-    return null;
-  }
-
-  // ─── Read: nudge toward execute_file ───
-  if (tool === "Read") {
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        additionalContext: READ_GUIDANCE,
-      },
-    };
-  }
-
-  // ─── Grep: nudge toward execute ───
-  if (tool === "Grep") {
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        additionalContext: GREP_GUIDANCE,
-      },
-    };
-  }
-
-  // ─── WebFetch: deny + redirect to sandbox ───
-  if (tool === "WebFetch") {
-    const url = toolInput.url ?? "";
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        reason: `context-mode: WebFetch blocked. Use mcp__plugin_context-mode_context-mode__fetch_and_index(url: "${url}", source: "...") to fetch this URL in sandbox. Then use mcp__plugin_context-mode_context-mode__search(queries: [...]) to query results. Do NOT use curl/wget — they are also blocked.`,
-      },
-    };
-  }
-
-  // ─── Task: inject context-mode routing into subagent prompts ───
-  if (tool === "Task") {
-    const subagentType = toolInput.subagent_type ?? "";
-    const prompt = toolInput.prompt ?? "";
-
-    const updatedInput =
-      subagentType === "Bash"
-        ? { ...toolInput, prompt: prompt + ROUTING_BLOCK, subagent_type: "general-purpose" }
-        : { ...toolInput, prompt: prompt + ROUTING_BLOCK };
-
-    return {
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        updatedInput,
-      },
-    };
-  }
-
-  // ─── MCP execute: security check for shell commands ───
-  if (tool.includes("context-mode") && tool.endsWith("__execute")) {
-    if (security && toolInput.language === "shell") {
-      const code = toolInput.code ?? "";
-      const policies = security.readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-      if (policies.length > 0) {
-        const result = security.evaluateCommand(code, policies);
-        if (result.decision === "deny") {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "deny",
-              reason: `Blocked by security policy: shell code matches deny pattern ${result.matchedPattern}`,
-            },
-          };
-        }
-        if (result.decision === "ask" && result.matchedPattern) {
-          return {
-            hookSpecificOutput: {
-              hookEventName: "PreToolUse",
-              permissionDecision: "ask",
-            },
-          };
-        }
-      }
-    }
-    return null;
-  }
-
-  // ─── MCP execute_file: check file path + code against deny patterns ───
-  if (tool.includes("context-mode") && tool.endsWith("__execute_file")) {
-    if (security) {
-      // Check file path against Read deny patterns
-      const filePath = toolInput.path ?? "";
-      const denyGlobs = security.readToolDenyPatterns("Read", process.env.CLAUDE_PROJECT_DIR);
-      const evalResult = security.evaluateFilePath(filePath, denyGlobs);
-      if (evalResult.denied) {
-        return {
-          hookSpecificOutput: {
-            hookEventName: "PreToolUse",
-            permissionDecision: "deny",
-            reason: `Blocked by security policy: file path matches Read deny pattern ${evalResult.matchedPattern}`,
-          },
-        };
-      }
-
-      // Check code parameter against Bash deny patterns (same as execute)
-      const lang = toolInput.language ?? "";
-      const code = toolInput.code ?? "";
-      if (lang === "shell") {
-        const policies = security.readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-        if (policies.length > 0) {
-          const result = security.evaluateCommand(code, policies);
-          if (result.decision === "deny") {
-            return {
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                reason: `Blocked by security policy: shell code matches deny pattern ${result.matchedPattern}`,
-              },
-            };
-          }
-          if (result.decision === "ask" && result.matchedPattern) {
-            return {
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "ask",
-              },
-            };
-          }
-        }
-      }
-    }
-    return null;
-  }
-
-  // ─── MCP batch_execute: check each command individually ───
-  if (tool.includes("context-mode") && tool.endsWith("__batch_execute")) {
-    if (security) {
-      const commands = toolInput.commands ?? [];
-      const policies = security.readBashPolicies(process.env.CLAUDE_PROJECT_DIR);
-      if (policies.length > 0) {
-        for (const entry of commands) {
-          const cmd = entry.command ?? "";
-          const result = security.evaluateCommand(cmd, policies);
-          if (result.decision === "deny") {
-            return {
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "deny",
-                reason: `Blocked by security policy: batch command "${entry.label ?? cmd}" matches deny pattern ${result.matchedPattern}`,
-              },
-            };
-          }
-          if (result.decision === "ask" && result.matchedPattern) {
-            return {
-              hookSpecificOutput: {
-                hookEventName: "PreToolUse",
-                permissionDecision: "ask",
-              },
-            };
-          }
-        }
-      }
-    }
-    return null;
-  }
-
-  // Unknown tool — pass through
-  return null;
-}
-
-// ─── Output response ───
-// Write to stdout and let Node.js exit naturally. This guarantees stdout
-// is fully flushed on all platforms. On Windows, process.exit() can drop
-// piped stdout before the buffer is written — so we never call it.
-const response = route();
+// ─── Route and format response ───
+const decision = routePreToolUse(tool, toolInput, process.env.CLAUDE_PROJECT_DIR);
+const response = formatDecision("claude-code", decision);
 if (response !== null) {
   process.stdout.write(JSON.stringify(response) + "\n");
 }

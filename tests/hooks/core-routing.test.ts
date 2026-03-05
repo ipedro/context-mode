@@ -1,0 +1,256 @@
+import { describe, it, expect, beforeAll } from "vitest";
+
+// Dynamic import for .mjs module
+let routePreToolUse: (
+  toolName: string,
+  toolInput: Record<string, unknown>,
+  projectDir?: string,
+) => {
+  action: string;
+  reason?: string;
+  updatedInput?: Record<string, unknown>;
+  additionalContext?: string;
+} | null;
+
+let ROUTING_BLOCK: string;
+let READ_GUIDANCE: string;
+let GREP_GUIDANCE: string;
+
+beforeAll(async () => {
+  const mod = await import("../../hooks/core/routing.mjs");
+  routePreToolUse = mod.routePreToolUse;
+
+  const constants = await import("../../hooks/routing-block.mjs");
+  ROUTING_BLOCK = constants.ROUTING_BLOCK;
+  READ_GUIDANCE = constants.READ_GUIDANCE;
+  GREP_GUIDANCE = constants.GREP_GUIDANCE;
+});
+
+describe("routePreToolUse", () => {
+  // ─── Bash routing ──────────────────────────────────────
+
+  describe("Bash tool", () => {
+    it("denies curl commands with modify action", () => {
+      const result = routePreToolUse("Bash", {
+        command: "curl https://example.com",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect(result!.updatedInput).toBeDefined();
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "curl/wget blocked",
+      );
+    });
+
+    it("denies wget commands with modify action", () => {
+      const result = routePreToolUse("Bash", {
+        command: "wget https://example.com/file.tar.gz",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "curl/wget blocked",
+      );
+    });
+
+    it("denies inline fetch() with modify action", () => {
+      const result = routePreToolUse("Bash", {
+        command: 'node -e "fetch(\'https://api.example.com/data\')"',
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "Inline HTTP blocked",
+      );
+    });
+
+    it("denies requests.get() with modify action", () => {
+      const result = routePreToolUse("Bash", {
+        command: 'python -c "import requests; requests.get(\'https://example.com\')"',
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect((result!.updatedInput as Record<string, string>).command).toContain(
+        "Inline HTTP blocked",
+      );
+    });
+
+    it("allows git status (passthrough)", () => {
+      const result = routePreToolUse("Bash", { command: "git status" });
+      expect(result).toBeNull();
+    });
+
+    it("allows mkdir (passthrough)", () => {
+      const result = routePreToolUse("Bash", {
+        command: "mkdir -p /tmp/test-dir",
+      });
+      expect(result).toBeNull();
+    });
+
+    it("allows npm install (passthrough)", () => {
+      const result = routePreToolUse("Bash", { command: "npm install" });
+      expect(result).toBeNull();
+    });
+  });
+
+  // ─── Read routing ──────────────────────────────────────
+
+  describe("Read tool", () => {
+    it("returns context action with READ_GUIDANCE", () => {
+      const result = routePreToolUse("Read", {
+        file_path: "/some/file.ts",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("context");
+      expect(result!.additionalContext).toBe(READ_GUIDANCE);
+    });
+  });
+
+  // ─── Grep routing ──────────────────────────────────────
+
+  describe("Grep tool", () => {
+    it("returns context action with GREP_GUIDANCE", () => {
+      const result = routePreToolUse("Grep", {
+        pattern: "TODO",
+        path: "/some/dir",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("context");
+      expect(result!.additionalContext).toBe(GREP_GUIDANCE);
+    });
+  });
+
+  // ─── WebFetch routing ──────────────────────────────────
+
+  describe("WebFetch tool", () => {
+    it("returns deny action with redirect message", () => {
+      const result = routePreToolUse("WebFetch", {
+        url: "https://docs.example.com",
+        prompt: "Get the docs",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("deny");
+      expect(result!.reason).toContain("WebFetch blocked");
+      expect(result!.reason).toContain("fetch_and_index");
+    });
+
+    it("includes the URL in deny reason", () => {
+      const url = "https://api.github.com/repos/test";
+      const result = routePreToolUse("WebFetch", { url });
+      expect(result).not.toBeNull();
+      expect(result!.reason).toContain(url);
+    });
+  });
+
+  // ─── Task routing ──────────────────────────────────────
+
+  describe("Task tool", () => {
+    it("injects ROUTING_BLOCK into prompt", () => {
+      const result = routePreToolUse("Task", {
+        prompt: "Analyze the codebase",
+        subagent_type: "general-purpose",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect(result!.updatedInput).toBeDefined();
+      expect((result!.updatedInput as Record<string, string>).prompt).toContain(
+        "Analyze the codebase",
+      );
+      expect((result!.updatedInput as Record<string, string>).prompt).toContain(
+        "context_window_protection",
+      );
+    });
+
+    it("upgrades Bash subagent to general-purpose", () => {
+      const result = routePreToolUse("Task", {
+        prompt: "Run some commands",
+        subagent_type: "Bash",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect(
+        (result!.updatedInput as Record<string, string>).subagent_type,
+      ).toBe("general-purpose");
+    });
+
+    it("keeps non-Bash subagent type unchanged", () => {
+      const result = routePreToolUse("Task", {
+        prompt: "Do research",
+        subagent_type: "general-purpose",
+      });
+      expect(result).not.toBeNull();
+      expect(result!.action).toBe("modify");
+      expect(
+        (result!.updatedInput as Record<string, string>).subagent_type,
+      ).toBe("general-purpose");
+    });
+  });
+
+  // ─── MCP tools ─────────────────────────────────────────
+
+  describe("MCP execute tools", () => {
+    it("passes through non-shell execute", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__execute",
+        { language: "javascript", code: "console.log('hello')" },
+      );
+      expect(result).toBeNull();
+    });
+
+    it("passes through execute_file without security", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__execute_file",
+        {
+          path: "/some/file.log",
+          language: "python",
+          code: "print(len(FILE_CONTENT))",
+        },
+      );
+      expect(result).toBeNull();
+    });
+
+    it("passes through batch_execute without security", () => {
+      const result = routePreToolUse(
+        "mcp__plugin_context-mode_context-mode__batch_execute",
+        {
+          commands: [{ label: "test", command: "ls -la" }],
+          queries: ["file list"],
+        },
+      );
+      expect(result).toBeNull();
+    });
+  });
+
+  // ─── Unknown tools ─────────────────────────────────────
+
+  describe("unknown tools", () => {
+    it("returns null for Glob", () => {
+      const result = routePreToolUse("Glob", { pattern: "**/*.ts" });
+      expect(result).toBeNull();
+    });
+
+    it("returns null for Edit", () => {
+      const result = routePreToolUse("Edit", {
+        file_path: "/some/file.ts",
+        old_string: "foo",
+        new_string: "bar",
+      });
+      expect(result).toBeNull();
+    });
+
+    it("returns null for Write", () => {
+      const result = routePreToolUse("Write", {
+        file_path: "/some/file.ts",
+        content: "hello",
+      });
+      expect(result).toBeNull();
+    });
+
+    it("returns null for WebSearch", () => {
+      const result = routePreToolUse("WebSearch", {
+        query: "vitest documentation",
+      });
+      expect(result).toBeNull();
+    });
+  });
+});

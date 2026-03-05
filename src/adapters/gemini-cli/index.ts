@@ -1,17 +1,22 @@
 /**
- * adapters/claude-code — Claude Code platform adapter.
+ * adapters/gemini-cli — Gemini CLI platform adapter.
  *
- * Implements HookAdapter for Claude Code's JSON stdin/stdout hook paradigm.
+ * Implements HookAdapter for Gemini CLI's JSON stdin/stdout hook paradigm.
  *
- * Claude Code hook specifics:
- *   - I/O: JSON on stdin, JSON on stdout
- *   - Arg modification: `updatedInput` field in response
- *   - Blocking: `permissionDecision: "deny"` in response
- *   - PostToolUse output: `updatedMCPToolOutput` field
- *   - PreCompact: stdout on exit 0
- *   - Session ID: transcript_path UUID > session_id > CLAUDE_SESSION_ID > ppid
- *   - Config: ~/.claude/settings.json
- *   - Session dir: ~/.claude/context-mode/sessions/
+ * Gemini CLI hook specifics:
+ *   - I/O: JSON on stdin, JSON on stdout (same paradigm as Claude Code)
+ *   - Hook names: BeforeTool, AfterTool, PreCompress, SessionStart
+ *   - Arg modification: `hookSpecificOutput.tool_input` (merged with original)
+ *   - Blocking: `decision: "deny"` in response (NOT permissionDecision)
+ *   - Output modification: `decision: "deny"` + reason replaces output,
+ *     `hookSpecificOutput.additionalContext` appends
+ *   - PreCompress: advisory only (async, cannot block)
+ *   - No `decision: "ask"` support
+ *   - Hooks don't fire for subagents yet
+ *   - Config: ~/.gemini/settings.json (user), .gemini/settings.json (project)
+ *   - Session ID: session_id field
+ *   - Project dir env: GEMINI_PROJECT_DIR (also CLAUDE_PROJECT_DIR alias)
+ *   - Session dir: ~/.gemini/context-mode/sessions/
  */
 
 import { createHash } from "node:crypto";
@@ -21,7 +26,6 @@ import {
   mkdirSync,
   copyFileSync,
   accessSync,
-  readdirSync,
   chmodSync,
   constants,
 } from "node:fs";
@@ -44,35 +48,35 @@ import type {
   HookRegistration,
   RoutingInstructionsConfig,
 } from "../types.js";
-import {
-  HOOK_TYPES,
-  HOOK_SCRIPTS,
-  PRE_TOOL_USE_MATCHER_PATTERN,
-  isContextModeHook,
-  buildHookCommand,
-  type HookType,
-} from "./hooks.js";
 
 // ─────────────────────────────────────────────────────────
-// Claude Code raw input types
+// Gemini CLI raw input types
 // ─────────────────────────────────────────────────────────
 
-interface ClaudeCodeHookInput {
+interface GeminiCLIHookInput {
   tool_name?: string;
   tool_input?: Record<string, unknown>;
   tool_output?: string;
   is_error?: boolean;
   session_id?: string;
-  transcript_path?: string;
   source?: string;
 }
+
+// ─────────────────────────────────────────────────────────
+// Hook constants (re-exported from hooks.ts)
+// ─────────────────────────────────────────────────────────
+
+import {
+  HOOK_TYPES as GEMINI_HOOK_NAMES,
+  HOOK_SCRIPTS as GEMINI_HOOK_SCRIPTS,
+} from "./hooks.js";
 
 // ─────────────────────────────────────────────────────────
 // Adapter implementation
 // ─────────────────────────────────────────────────────────
 
-export class ClaudeCodeAdapter implements HookAdapter {
-  readonly name = "Claude Code";
+export class GeminiCLIAdapter implements HookAdapter {
+  readonly name = "Gemini CLI";
   readonly paradigm: HookParadigm = "json-stdio";
 
   readonly capabilities: PlatformCapabilities = {
@@ -88,40 +92,40 @@ export class ClaudeCodeAdapter implements HookAdapter {
   // ── Input parsing ──────────────────────────────────────
 
   parsePreToolUseInput(raw: unknown): PreToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
+    const input = raw as GeminiCLIHookInput;
     return {
       toolName: input.tool_name ?? "",
       toolInput: input.tool_input ?? {},
       sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
+      projectDir: this.getProjectDir(),
       raw,
     };
   }
 
   parsePostToolUseInput(raw: unknown): PostToolUseEvent {
-    const input = raw as ClaudeCodeHookInput;
+    const input = raw as GeminiCLIHookInput;
     return {
       toolName: input.tool_name ?? "",
       toolInput: input.tool_input ?? {},
       toolOutput: input.tool_output,
       isError: input.is_error,
       sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
+      projectDir: this.getProjectDir(),
       raw,
     };
   }
 
   parsePreCompactInput(raw: unknown): PreCompactEvent {
-    const input = raw as ClaudeCodeHookInput;
+    const input = raw as GeminiCLIHookInput;
     return {
       sessionId: this.extractSessionId(input),
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
+      projectDir: this.getProjectDir(),
       raw,
     };
   }
 
   parseSessionStartInput(raw: unknown): SessionStartEvent {
-    const input = raw as ClaudeCodeHookInput;
+    const input = raw as GeminiCLIHookInput;
     const rawSource = input.source ?? "startup";
 
     let source: SessionStartEvent["source"];
@@ -142,7 +146,7 @@ export class ClaudeCodeAdapter implements HookAdapter {
     return {
       sessionId: this.extractSessionId(input),
       source,
-      projectDir: process.env.CLAUDE_PROJECT_DIR,
+      projectDir: this.getProjectDir(),
       raw,
     };
   }
@@ -152,46 +156,56 @@ export class ClaudeCodeAdapter implements HookAdapter {
   formatPreToolUseResponse(response: PreToolUseResponse): unknown {
     if (response.decision === "deny") {
       return {
-        permissionDecision: "deny",
+        decision: "deny",
         reason: response.reason ?? "Blocked by context-mode hook",
       };
     }
     if (response.decision === "modify" && response.updatedInput) {
-      return { updatedInput: response.updatedInput };
+      return {
+        hookSpecificOutput: {
+          tool_input: response.updatedInput,
+        },
+      };
     }
-    // "allow" — return null/undefined for passthrough
+    // "allow" — return undefined for passthrough
     return undefined;
   }
 
   formatPostToolUseResponse(response: PostToolUseResponse): unknown {
-    const result: Record<string, unknown> = {};
-    if (response.additionalContext) {
-      result.additionalContext = response.additionalContext;
-    }
     if (response.updatedOutput) {
-      result.updatedMCPToolOutput = response.updatedOutput;
+      // Gemini CLI: decision "deny" + reason replaces output
+      return {
+        decision: "deny",
+        reason: response.updatedOutput,
+      };
     }
-    return Object.keys(result).length > 0 ? result : undefined;
+    if (response.additionalContext) {
+      return {
+        hookSpecificOutput: {
+          additionalContext: response.additionalContext,
+        },
+      };
+    }
+    return undefined;
   }
 
   formatPreCompactResponse(response: PreCompactResponse): unknown {
-    // Claude Code: stdout content on exit 0 is injected as context
+    // PreCompress is advisory only (async), but we can still return context
     return response.context ?? "";
   }
 
   formatSessionStartResponse(response: SessionStartResponse): unknown {
-    // Claude Code: stdout content is injected as additional context
     return response.context ?? "";
   }
 
   // ── Configuration ──────────────────────────────────────
 
   getSettingsPath(): string {
-    return resolve(homedir(), ".claude", "settings.json");
+    return resolve(homedir(), ".gemini", "settings.json");
   }
 
   getSessionDir(): string {
-    const dir = join(homedir(), ".claude", "context-mode", "sessions");
+    const dir = join(homedir(), ".gemini", "context-mode", "sessions");
     mkdirSync(dir, { recursive: true });
     return dir;
   }
@@ -213,63 +227,49 @@ export class ClaudeCodeAdapter implements HookAdapter {
   }
 
   generateHookConfig(pluginRoot: string): HookRegistration {
-    const preToolUseCommand = `node ${pluginRoot}/hooks/pretooluse.mjs`;
-    const preToolUseMatchers = [
-      "Bash",
-      "WebFetch",
-      "Read",
-      "Grep",
-      "Task",
-      "mcp__plugin_context-mode_context-mode__execute",
-      "mcp__plugin_context-mode_context-mode__execute_file",
-      "mcp__plugin_context-mode_context-mode__batch_execute",
-    ];
+    const hooksDir = join(pluginRoot, "hooks", "gemini-cli");
 
     return {
-      PreToolUse: preToolUseMatchers.map((matcher) => ({
-        matcher,
-        hooks: [{ type: "command", command: preToolUseCommand }],
-      })),
-      PostToolUse: [
+      [GEMINI_HOOK_NAMES.BEFORE_TOOL]: [
         {
           matcher: "",
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/posttooluse.mjs`,
+              command: `node ${hooksDir}/${GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.BEFORE_TOOL]}`,
             },
           ],
         },
       ],
-      PreCompact: [
+      [GEMINI_HOOK_NAMES.AFTER_TOOL]: [
         {
           matcher: "",
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/precompact.mjs`,
+              command: `node ${hooksDir}/${GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.AFTER_TOOL]}`,
             },
           ],
         },
       ],
-      UserPromptSubmit: [
+      [GEMINI_HOOK_NAMES.PRE_COMPRESS]: [
         {
           matcher: "",
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/userpromptsubmit.mjs`,
+              command: `node ${hooksDir}/${GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.PRE_COMPRESS]}`,
             },
           ],
         },
       ],
-      SessionStart: [
+      [GEMINI_HOOK_NAMES.SESSION_START]: [
         {
           matcher: "",
           hooks: [
             {
               type: "command",
-              command: `node ${pluginRoot}/hooks/sessionstart.mjs`,
+              command: `node ${hooksDir}/${GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.SESSION_START]}`,
             },
           ],
         },
@@ -287,6 +287,8 @@ export class ClaudeCodeAdapter implements HookAdapter {
   }
 
   writeSettings(settings: Record<string, unknown>): void {
+    const dir = resolve(homedir(), ".gemini");
+    mkdirSync(dir, { recursive: true });
     writeFileSync(
       this.getSettingsPath(),
       JSON.stringify(settings, null, 2) + "\n",
@@ -302,63 +304,63 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
     if (!settings) {
       results.push({
-        check: "PreToolUse hook",
+        check: "BeforeTool hook",
         status: "fail",
-        message: "Could not read ~/.claude/settings.json",
-        fix: "npx context-mode upgrade",
+        message: "Could not read ~/.gemini/settings.json",
+        fix: "npx context-mode upgrade --platform gemini-cli",
       });
       return results;
     }
 
     const hooks = settings.hooks as Record<string, unknown[]> | undefined;
 
-    // Check PreToolUse
-    const preToolUse = hooks?.PreToolUse as
+    // Check BeforeTool
+    const beforeTool = hooks?.[GEMINI_HOOK_NAMES.BEFORE_TOOL] as
       | Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>
       | undefined;
-    if (preToolUse && preToolUse.length > 0) {
-      const hasHook = preToolUse.some((entry) =>
-        isContextModeHook(entry, HOOK_TYPES.PRE_TOOL_USE),
+    if (beforeTool && beforeTool.length > 0) {
+      const hasHook = beforeTool.some((entry) =>
+        entry.hooks?.some((h) => h.command?.includes("context-mode")),
       );
       results.push({
-        check: "PreToolUse hook",
+        check: "BeforeTool hook",
         status: hasHook ? "pass" : "fail",
         message: hasHook
-          ? "PreToolUse hook configured"
-          : "PreToolUse exists but does not point to pretooluse.mjs",
-        fix: hasHook ? undefined : "npx context-mode upgrade",
+          ? "BeforeTool hook configured"
+          : "BeforeTool exists but does not point to context-mode",
+        fix: hasHook ? undefined : "npx context-mode upgrade --platform gemini-cli",
       });
     } else {
       results.push({
-        check: "PreToolUse hook",
+        check: "BeforeTool hook",
         status: "fail",
-        message: "No PreToolUse hooks found",
-        fix: "npx context-mode upgrade",
+        message: "No BeforeTool hooks found",
+        fix: "npx context-mode upgrade --platform gemini-cli",
       });
     }
 
     // Check SessionStart
-    const sessionStart = hooks?.SessionStart as
+    const sessionStart = hooks?.[GEMINI_HOOK_NAMES.SESSION_START] as
       | Array<{ matcher?: string; hooks?: Array<{ command?: string }> }>
       | undefined;
     if (sessionStart && sessionStart.length > 0) {
       const hasHook = sessionStart.some((entry) =>
-        isContextModeHook(entry, HOOK_TYPES.SESSION_START),
+        entry.hooks?.some((h) => h.command?.includes("context-mode")),
       );
       results.push({
         check: "SessionStart hook",
         status: hasHook ? "pass" : "fail",
         message: hasHook
           ? "SessionStart hook configured"
-          : "SessionStart exists but does not point to sessionstart.mjs",
-        fix: hasHook ? undefined : "npx context-mode upgrade",
+          : "SessionStart exists but does not point to context-mode",
+        fix: hasHook ? undefined : "npx context-mode upgrade --platform gemini-cli",
       });
     } else {
       results.push({
         check: "SessionStart hook",
         status: "fail",
         message: "No SessionStart hooks found",
-        fix: "npx context-mode upgrade",
+        fix: "npx context-mode upgrade --platform gemini-cli",
       });
     }
 
@@ -371,92 +373,54 @@ export class ClaudeCodeAdapter implements HookAdapter {
       return {
         check: "Plugin registration",
         status: "warn",
-        message: "Could not read settings.json",
+        message: "Could not read ~/.gemini/settings.json",
       };
     }
 
-    const enabledPlugins = settings.enabledPlugins as
-      | Record<string, boolean>
+    // Check in extensions or settings for context-mode
+    const extensions = settings.extensions as
+      | Record<string, unknown>
+      | Array<unknown>
       | undefined;
-    if (!enabledPlugins) {
-      return {
-        check: "Plugin registration",
-        status: "warn",
-        message: "No enabledPlugins section found (might be using standalone MCP mode)",
-      };
-    }
 
-    const pluginKey = Object.keys(enabledPlugins).find((k) =>
-      k.startsWith("context-mode"),
-    );
+    if (extensions) {
+      const hasPlugin = Array.isArray(extensions)
+        ? extensions.some(
+            (e) =>
+              typeof e === "string" && e.includes("context-mode"),
+          )
+        : Object.keys(extensions).some((k) => k.includes("context-mode"));
 
-    if (pluginKey && enabledPlugins[pluginKey]) {
-      return {
-        check: "Plugin registration",
-        status: "pass",
-        message: `Plugin enabled: ${pluginKey}`,
-      };
+      if (hasPlugin) {
+        return {
+          check: "Plugin registration",
+          status: "pass",
+          message: "context-mode found in extensions",
+        };
+      }
     }
 
     return {
       check: "Plugin registration",
       status: "warn",
-      message: "context-mode not in enabledPlugins (might be using standalone MCP mode)",
+      message: "context-mode not found in extensions (might be using standalone MCP mode)",
     };
   }
 
   getInstalledVersion(): string {
-    // Primary: read from installed_plugins.json
+    // Check ~/.gemini/ extension cache for context-mode
     try {
-      const ipPath = resolve(
+      const cachePath = resolve(
         homedir(),
-        ".claude",
-        "plugins",
-        "installed_plugins.json",
-      );
-      const ipRaw = JSON.parse(readFileSync(ipPath, "utf-8"));
-      const plugins = ipRaw.plugins ?? {};
-      for (const [key, entries] of Object.entries(plugins)) {
-        if (!key.toLowerCase().includes("context-mode")) continue;
-        const arr = entries as Array<Record<string, unknown>>;
-        if (arr.length > 0 && typeof arr[0].version === "string") {
-          return arr[0].version;
-        }
-      }
-    } catch {
-      /* fallback below */
-    }
-
-    // Fallback: scan common plugin cache locations
-    const bases = [
-      resolve(homedir(), ".claude"),
-      resolve(homedir(), ".config", "claude"),
-    ];
-    for (const base of bases) {
-      const cacheDir = resolve(
-        base,
-        "plugins",
-        "cache",
-        "claude-context-mode",
+        ".gemini",
+        "extensions",
         "context-mode",
+        "package.json",
       );
-      try {
-        const entries = readdirSync(cacheDir);
-        const versions = entries
-          .filter((e) => /^\d+\.\d+\.\d+/.test(e))
-          .sort((a, b) => {
-            const pa = a.split(".").map(Number);
-            const pb = b.split(".").map(Number);
-            for (let i = 0; i < 3; i++) {
-              if ((pa[i] ?? 0) !== (pb[i] ?? 0))
-                return (pa[i] ?? 0) - (pb[i] ?? 0);
-            }
-            return 0;
-          });
-        if (versions.length > 0) return versions[versions.length - 1];
-      } catch {
-        /* continue */
-      }
+      const pkg = JSON.parse(readFileSync(cachePath, "utf-8"));
+      if (typeof pkg.version === "string") return pkg.version;
+    } catch {
+      /* not found */
     }
     return "not installed";
   }
@@ -467,59 +431,48 @@ export class ClaudeCodeAdapter implements HookAdapter {
     const settings = this.readSettings() ?? {};
     const hooks = (settings.hooks ?? {}) as Record<string, unknown>;
     const changes: string[] = [];
+    const hooksDir = join(pluginRoot, "hooks", "gemini-cli");
 
-    const hookTypes: HookType[] = [
-      HOOK_TYPES.PRE_TOOL_USE,
-      HOOK_TYPES.SESSION_START,
+    const hookConfigs: Array<{
+      name: string;
+      script: string;
+    }> = [
+      {
+        name: GEMINI_HOOK_NAMES.BEFORE_TOOL,
+        script: GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.BEFORE_TOOL],
+      },
+      {
+        name: GEMINI_HOOK_NAMES.SESSION_START,
+        script: GEMINI_HOOK_SCRIPTS[GEMINI_HOOK_NAMES.SESSION_START],
+      },
     ];
 
-    for (const hookType of hookTypes) {
-      const command = buildHookCommand(hookType, pluginRoot);
+    for (const config of hookConfigs) {
+      const command = `node ${hooksDir}/${config.script}`;
+      const entry = {
+        matcher: "",
+        hooks: [{ type: "command", command }],
+      };
 
-      if (hookType === HOOK_TYPES.PRE_TOOL_USE) {
-        const entry = {
-          matcher: PRE_TOOL_USE_MATCHER_PATTERN,
-          hooks: [{ type: "command", command }],
-        };
-        const existing = hooks.PreToolUse as Array<Record<string, unknown>> | undefined;
-        if (existing && Array.isArray(existing)) {
-          const idx = existing.findIndex((e) =>
-            isContextModeHook(e as { hooks?: Array<{ command?: string }> }, hookType),
-          );
-          if (idx >= 0) {
-            existing[idx] = entry;
-            changes.push(`Updated existing ${hookType} hook entry`);
-          } else {
-            existing.push(entry);
-            changes.push(`Added ${hookType} hook entry`);
-          }
-          hooks.PreToolUse = existing;
+      const existing = hooks[config.name] as
+        | Array<Record<string, unknown>>
+        | undefined;
+      if (existing && Array.isArray(existing)) {
+        const idx = existing.findIndex((e) => {
+          const entryHooks = e.hooks as Array<{ command?: string }> | undefined;
+          return entryHooks?.some((h) => h.command?.includes("context-mode"));
+        });
+        if (idx >= 0) {
+          existing[idx] = entry;
+          changes.push(`Updated existing ${config.name} hook entry`);
         } else {
-          hooks.PreToolUse = [entry];
-          changes.push(`Created ${hookType} hooks section`);
+          existing.push(entry);
+          changes.push(`Added ${config.name} hook entry`);
         }
+        hooks[config.name] = existing;
       } else {
-        const entry = {
-          matcher: "",
-          hooks: [{ type: "command", command }],
-        };
-        const existing = hooks[hookType] as Array<Record<string, unknown>> | undefined;
-        if (existing && Array.isArray(existing)) {
-          const idx = existing.findIndex((e) =>
-            isContextModeHook(e as { hooks?: Array<{ command?: string }> }, hookType),
-          );
-          if (idx >= 0) {
-            existing[idx] = entry;
-            changes.push(`Updated existing ${hookType} hook entry`);
-          } else {
-            existing.push(entry);
-            changes.push(`Added ${hookType} hook entry`);
-          }
-          hooks[hookType] = existing;
-        } else {
-          hooks[hookType] = [entry];
-          changes.push(`Created ${hookType} hooks section`);
-        }
+        hooks[config.name] = [entry];
+        changes.push(`Created ${config.name} hooks section`);
       }
     }
 
@@ -542,8 +495,9 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
   setHookPermissions(pluginRoot: string): string[] {
     const set: string[] = [];
-    for (const [, scriptName] of Object.entries(HOOK_SCRIPTS)) {
-      const scriptPath = resolve(pluginRoot, "hooks", scriptName);
+    const hooksDir = join(pluginRoot, "hooks", "gemini-cli");
+    for (const scriptName of Object.values(GEMINI_HOOK_SCRIPTS)) {
+      const scriptPath = resolve(hooksDir, scriptName);
       try {
         accessSync(scriptPath, constants.R_OK);
         chmodSync(scriptPath, 0o755);
@@ -556,23 +510,21 @@ export class ClaudeCodeAdapter implements HookAdapter {
   }
 
   updatePluginRegistry(pluginRoot: string, version: string): void {
+    // Gemini CLI doesn't have a formal plugin registry like Claude Code.
+    // Update the extension cache package.json if it exists.
     try {
-      const ipPath = resolve(
+      const pkgPath = resolve(
         homedir(),
-        ".claude",
-        "plugins",
-        "installed_plugins.json",
+        ".gemini",
+        "extensions",
+        "context-mode",
+        "package.json",
       );
-      const ipRaw = JSON.parse(readFileSync(ipPath, "utf-8"));
-      for (const [key, entries] of Object.entries(ipRaw.plugins || {})) {
-        if (!key.toLowerCase().includes("context-mode")) continue;
-        for (const entry of entries as Array<Record<string, unknown>>) {
-          entry.installPath = pluginRoot;
-          entry.version = version;
-          entry.lastUpdated = new Date().toISOString();
-        }
-      }
-      writeFileSync(ipPath, JSON.stringify(ipRaw, null, 2) + "\n", "utf-8");
+      const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
+      pkg.version = version;
+      pkg.installPath = pluginRoot;
+      pkg.lastUpdated = new Date().toISOString();
+      writeFileSync(pkgPath, JSON.stringify(pkg, null, 2) + "\n", "utf-8");
     } catch {
       /* best effort */
     }
@@ -582,29 +534,26 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
   getRoutingInstructionsConfig(): RoutingInstructionsConfig {
     return {
-      fileName: "CLAUDE.md",
-      globalPath: resolve(homedir(), ".claude", "CLAUDE.md"),
-      projectRelativePath: "CLAUDE.md",
+      fileName: "GEMINI.md",
+      globalPath: resolve(homedir(), ".gemini", "GEMINI.md"),
+      projectRelativePath: "GEMINI.md",
     };
   }
 
   writeRoutingInstructions(projectDir: string, pluginRoot: string): string | null {
     const config = this.getRoutingInstructionsConfig();
     const targetPath = resolve(projectDir, config.projectRelativePath);
-    const sourcePath = resolve(pluginRoot, "configs", "claude-code", config.fileName);
+    const sourcePath = resolve(pluginRoot, "configs", "gemini-cli", config.fileName);
 
     try {
       const content = readFileSync(sourcePath, "utf-8");
 
-      // Check if file exists and already has context-mode instructions
       try {
         const existing = readFileSync(targetPath, "utf-8");
         if (existing.includes("context-mode")) return null;
-        // Append to existing file
         writeFileSync(targetPath, existing.trimEnd() + "\n\n" + content, "utf-8");
         return targetPath;
       } catch {
-        // File doesn't exist — create it
         writeFileSync(targetPath, content, "utf-8");
         return targetPath;
       }
@@ -615,19 +564,17 @@ export class ClaudeCodeAdapter implements HookAdapter {
 
   // ── Internal helpers ───────────────────────────────────
 
+  /** Get the project directory from environment variables. */
+  private getProjectDir(): string | undefined {
+    return process.env.GEMINI_PROJECT_DIR ?? process.env.CLAUDE_PROJECT_DIR;
+  }
+
   /**
-   * Extract session ID from Claude Code hook input.
-   * Priority: transcript_path UUID > session_id field > CLAUDE_SESSION_ID env > ppid fallback.
+   * Extract session ID from Gemini CLI hook input.
+   * Priority: session_id field > env fallback > ppid fallback.
    */
-  private extractSessionId(input: ClaudeCodeHookInput): string {
-    if (input.transcript_path) {
-      const match = input.transcript_path.match(
-        /([a-f0-9-]{36})\.jsonl$/,
-      );
-      if (match) return match[1];
-    }
+  private extractSessionId(input: GeminiCLIHookInput): string {
     if (input.session_id) return input.session_id;
-    if (process.env.CLAUDE_SESSION_ID) return process.env.CLAUDE_SESSION_ID;
     return `pid-${process.ppid}`;
   }
 }

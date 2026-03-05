@@ -4,10 +4,11 @@
  *
  * Usage:
  *   context-mode          → Start MCP server (stdio)
- *   context-mode setup    → Interactive setup (detect runtimes, install Bun)
  *   context-mode doctor   → Diagnose runtime issues, hooks, FTS5, version
  *   context-mode upgrade  → Fix hooks, permissions, and settings
- *   context-mode stats    → (skill only — /context-mode:ctx-stats)
+ *
+ * Platform auto-detection: CLI detects which platform is running
+ * (Claude Code, Gemini CLI, OpenCode, etc.) and uses the appropriate adapter.
  */
 
 import * as p from "@clack/prompts";
@@ -24,25 +25,12 @@ import {
 } from "./runtime.js";
 
 // ── Adapter imports ──────────────────────────────────────
-import {
-  readSettings,
-  getSettingsPath,
-  backupSettings,
-  configureHook,
-  validateHooks,
-  checkPluginRegistration,
-  getMarketplaceVersion,
-  updatePluginRegistry,
-  setHookPermissions,
-  writeSettings,
-} from "./adapters/claude-code/config.js";
-import { HOOK_TYPES } from "./adapters/claude-code/hooks.js";
+import { detectPlatform, getAdapter } from "./adapters/detect.js";
+import type { HookAdapter } from "./adapters/types.js";
 
 const args = process.argv.slice(2);
 
-if (args[0] === "setup") {
-  setup();
-} else if (args[0] === "doctor") {
+if (args[0] === "doctor") {
   doctor().then((code) => process.exit(code));
 } else if (args[0] === "upgrade") {
   upgrade();
@@ -86,24 +74,22 @@ async function fetchLatestVersion(): Promise<string> {
   }
 }
 
-function semverGt(a: string, b: string): boolean {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    if ((pa[i] ?? 0) > (pb[i] ?? 0)) return true;
-    if ((pa[i] ?? 0) < (pb[i] ?? 0)) return false;
-  }
-  return false;
-}
-
 /* -------------------------------------------------------
- * Doctor
+ * Doctor — adapter-aware diagnostics
  * ------------------------------------------------------- */
 
 async function doctor(): Promise<number> {
   if (process.stdout.isTTY) console.clear();
 
+  // Detect platform
+  const detection = detectPlatform();
+  const adapter = await getAdapter(detection.platform);
+
   p.intro(color.bgMagenta(color.white(" context-mode doctor ")));
+  p.log.info(
+    `Platform: ${color.cyan(adapter.name)}` +
+      color.dim(` (${detection.confidence} confidence — ${detection.reason})`),
+  );
 
   let criticalFails = 0;
 
@@ -118,7 +104,7 @@ async function doctor(): Promise<number> {
   } catch {
     s.stop("Diagnostics partial");
     p.log.warn(color.yellow("Could not detect runtimes") + color.dim(" — module may be missing, restart session after upgrade"));
-    p.outro(color.yellow("Doctor could not fully run — try again after restarting Claude Code"));
+    p.outro(color.yellow("Doctor could not fully run — try again after restarting"));
     return 1;
   }
 
@@ -185,19 +171,19 @@ async function doctor(): Promise<number> {
     }
   }
 
-  // Hooks installed — using adapter validation
-  p.log.step("Checking hooks configuration...");
+  // Hooks — adapter-aware validation
+  p.log.step(`Checking ${adapter.name} hooks configuration...`);
   const pluginRoot = getPluginRoot();
-  const hookResults = validateHooks(pluginRoot);
+  const hookResults = adapter.validateHooks(pluginRoot);
 
   for (const result of hookResults) {
     if (result.status === "pass") {
-      p.log.success(color.green(`${result.hookType} hook: PASS`) + ` — ${result.message}`);
+      p.log.success(color.green(`${result.check}: PASS`) + ` — ${result.message}`);
     } else {
       p.log.error(
-        color.red(`${result.hookType} hook: FAIL`) +
+        color.red(`${result.check}: FAIL`) +
           ` — ${result.message}` +
-          color.dim("\n  Run: npx context-mode upgrade"),
+          (result.fix ? color.dim(`\n  Run: ${result.fix}`) : ""),
       );
     }
   }
@@ -215,11 +201,11 @@ async function doctor(): Promise<number> {
     );
   }
 
-  // Plugin enabled — using adapter check
-  p.log.step("Checking plugin registration...");
-  const pluginCheck = checkPluginRegistration();
+  // Plugin registration — adapter-aware
+  p.log.step(`Checking ${adapter.name} plugin registration...`);
+  const pluginCheck = adapter.checkPluginRegistration();
   if (pluginCheck.status === "pass") {
-    p.log.success(color.green("Plugin enabled: PASS") + color.dim(` — ${pluginCheck.pluginKey}`));
+    p.log.success(color.green("Plugin enabled: PASS") + color.dim(` — ${pluginCheck.message}`));
   } else {
     p.log.warn(
       color.yellow("Plugin enabled: WARN") +
@@ -256,13 +242,12 @@ async function doctor(): Promise<number> {
     }
   }
 
-  // Version check
+  // Version check — adapter-aware
   p.log.step("Checking versions...");
   const localVersion = getLocalVersion();
   const latestVersion = await fetchLatestVersion();
-  const marketplaceVersion = getMarketplaceVersion();
+  const installedVersion = adapter.getInstalledVersion();
 
-  // npm / MCP version
   if (latestVersion === "unknown") {
     p.log.warn(
       color.yellow("npm (MCP): WARN") +
@@ -281,26 +266,25 @@ async function doctor(): Promise<number> {
     );
   }
 
-  // Marketplace version
-  if (marketplaceVersion === "not installed") {
+  if (installedVersion === "not installed") {
     p.log.info(
-      color.dim("Marketplace: not installed") +
+      color.dim(`${adapter.name}: not installed`) +
         " — using standalone MCP mode",
     );
-  } else if (latestVersion !== "unknown" && marketplaceVersion === latestVersion) {
+  } else if (latestVersion !== "unknown" && installedVersion === latestVersion) {
     p.log.success(
-      color.green("Marketplace: PASS") +
-        ` — v${marketplaceVersion}`,
+      color.green(`${adapter.name}: PASS`) +
+        ` — v${installedVersion}`,
     );
   } else if (latestVersion !== "unknown") {
     p.log.warn(
-      color.yellow("Marketplace: WARN") +
-        ` — v${marketplaceVersion}, latest v${latestVersion}` +
+      color.yellow(`${adapter.name}: WARN`) +
+        ` — v${installedVersion}, latest v${latestVersion}` +
         color.dim("\n  Run: /context-mode:ctx-upgrade"),
     );
   } else {
     p.log.info(
-      `Marketplace: v${marketplaceVersion}` +
+      `${adapter.name}: v${installedVersion}` +
         color.dim(" — could not verify against npm registry"),
     );
   }
@@ -322,19 +306,27 @@ async function doctor(): Promise<number> {
 }
 
 /* -------------------------------------------------------
- * Upgrade
+ * Upgrade — adapter-aware hook configuration
  * ------------------------------------------------------- */
 
 async function upgrade() {
   if (process.stdout.isTTY) console.clear();
 
+  // Detect platform
+  const detection = detectPlatform();
+  const adapter = await getAdapter(detection.platform);
+
   p.intro(color.bgCyan(color.black(" context-mode upgrade ")));
+  p.log.info(
+    `Platform: ${color.cyan(adapter.name)}` +
+      color.dim(` (${detection.confidence} confidence)`),
+  );
 
   let pluginRoot = getPluginRoot();
   const changes: string[] = [];
   const s = p.spinner();
 
-  // Step 1: Pull latest from GitHub (same source as marketplace)
+  // Step 1: Pull latest from GitHub
   p.log.step("Pulling latest from GitHub...");
   const localVersion = getLocalVersion();
   const tmpDir = `/tmp/context-mode-upgrade-${Date.now()}`;
@@ -348,8 +340,6 @@ async function upgrade() {
     s.stop("Downloaded");
 
     const srcDir = tmpDir;
-
-    // Read new version
     const newPkg = JSON.parse(
       readFileSync(resolve(srcDir, "package.json"), "utf-8"),
     );
@@ -377,10 +367,9 @@ async function upgrade() {
     });
     s.stop("Built successfully");
 
-    // Step 3: Update in-place (same directory, no registry changes needed)
+    // Step 3: Update in-place
     s.start("Updating files in-place");
 
-    // Clean stale version dirs from previous upgrade attempts
     const cacheParentMatch = pluginRoot.match(
       /^(.*[\\/]plugins[\\/]cache[\\/][^\\/]+[\\/][^\\/]+[\\/])/,
     );
@@ -398,7 +387,6 @@ async function upgrade() {
       } catch { /* parent may not exist */ }
     }
 
-    // Copy new files over old ones — same path, no registry update needed
     const items = [
       "build", "src", "hooks", "skills", ".claude-plugin",
       "start.mjs", "server.bundle.mjs", "package.json", ".mcp.json",
@@ -411,11 +399,11 @@ async function upgrade() {
     }
     s.stop(color.green(`Updated in-place to v${newVersion}`));
 
-    // Fix registry — using adapter
-    updatePluginRegistry(pluginRoot, newVersion);
+    // Fix registry — adapter-aware
+    adapter.updatePluginRegistry(pluginRoot, newVersion);
     p.log.info(color.dim("  Registry synced to " + pluginRoot));
 
-    // Install production deps (rebuild native modules if needed)
+    // Install production deps
     s.start("Installing production dependencies");
     execSync("npm install --production --no-audit --no-fund", {
       cwd: pluginRoot,
@@ -424,7 +412,7 @@ async function upgrade() {
     });
     s.stop("Dependencies ready");
 
-    // Update global npm package from same GitHub source
+    // Update global npm
     s.start("Updating npm global package");
     try {
       execSync(`npm install -g "${pluginRoot}" --no-audit --no-fund 2>/dev/null`, {
@@ -455,52 +443,34 @@ async function upgrade() {
     s.stop(color.red("Update failed"));
     p.log.error(color.red("GitHub pull failed") + ` — ${message}`);
     p.log.info(color.dim("Continuing with hooks/settings fix..."));
-    // Cleanup on failure
     try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
   }
 
-  // Step 3: Backup settings.json — using adapter
-  p.log.step("Backing up settings.json...");
-  const backupPath = backupSettings();
+  // Step 3: Backup settings — adapter-aware
+  p.log.step(`Backing up ${adapter.name} settings...`);
+  const backupPath = adapter.backupSettings();
   if (backupPath) {
     p.log.success(color.green("Backup created") + color.dim(" -> " + backupPath));
-    changes.push("Backed up settings.json");
+    changes.push("Backed up settings");
   } else {
     p.log.warn(
-      color.yellow("No existing settings.json to backup") +
+      color.yellow("No existing settings to backup") +
         " — a new one will be created",
     );
   }
 
-  // Step 4: Fix hooks — using adapter
-  p.log.step("Configuring hooks...");
-  const settings = readSettings() ?? {};
-
-  const hookTypes = [
-    HOOK_TYPES.PRE_TOOL_USE,
-    HOOK_TYPES.SESSION_START,
-  ] as const;
-
-  for (const hookType of hookTypes) {
-    const result = configureHook(settings, hookType, pluginRoot);
-    p.log.info(color.dim(`  ${result}`));
-    changes.push(result);
+  // Step 4: Configure hooks — adapter-aware
+  p.log.step(`Configuring ${adapter.name} hooks...`);
+  const hookChanges = adapter.configureAllHooks(pluginRoot);
+  for (const change of hookChanges) {
+    p.log.info(color.dim(`  ${change}`));
+    changes.push(change);
   }
+  p.log.success(color.green("Hooks configured") + color.dim(` — ${adapter.name}`));
 
-  // Write updated settings — using adapter
-  try {
-    writeSettings(settings);
-    p.log.success(color.green("Hooks configured") + color.dim(" -> " + getSettingsPath()));
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    p.log.error(color.red("Failed to write settings.json") + " — " + message);
-    p.outro(color.red("Upgrade failed."));
-    process.exit(1);
-  }
-
-  // Step 5: Set hook script permissions — using adapter
+  // Step 5: Set hook script permissions — adapter-aware
   p.log.step("Setting hook script permissions...");
-  const permSet = setHookPermissions(pluginRoot);
+  const permSet = adapter.setHookPermissions(pluginRoot);
   if (permSet.length > 0) {
     p.log.success(color.green("Permissions set") + color.dim(` — ${permSet.length} hook script(s)`));
     changes.push(`Set ${permSet.length} hook scripts as executable`);
@@ -521,7 +491,7 @@ async function upgrade() {
     p.log.info(color.dim("No changes were needed."));
   }
 
-  // Step 7: Run doctor from updated pluginRoot
+  // Step 7: Run doctor
   p.log.step("Running doctor to verify...");
   console.log();
 
@@ -534,173 +504,7 @@ async function upgrade() {
   } catch {
     p.log.warn(
       color.yellow("Doctor had warnings") +
-        color.dim(" — restart your Claude Code session to pick up the new version"),
+        color.dim(` — restart your ${adapter.name} session to pick up the new version`),
     );
   }
-}
-
-/* -------------------------------------------------------
- * Setup
- * ------------------------------------------------------- */
-
-async function setup() {
-  if (process.stdout.isTTY) console.clear();
-
-  p.intro(color.bgCyan(color.black(" context-mode setup ")));
-
-  const s = p.spinner();
-
-  // Step 1: Detect runtimes
-  s.start("Detecting installed runtimes");
-  const runtimes = detectRuntimes();
-  const available = getAvailableLanguages(runtimes);
-  s.stop("Detected " + available.length + " languages");
-
-  // Show what's available
-  p.note(getRuntimeSummary(runtimes), "Detected Runtimes");
-
-  // Step 2: Check Bun
-  if (!hasBunRuntime()) {
-    p.log.warn(
-      color.yellow("Bun is not installed.") +
-        " JS/TS will run with Node.js (3-5x slower).",
-    );
-
-    const installBun = await p.confirm({
-      message: "Would you like to install Bun for faster execution?",
-      initialValue: true,
-    });
-
-    if (p.isCancel(installBun)) {
-      p.cancel("Setup cancelled.");
-      process.exit(0);
-    }
-
-    if (installBun) {
-      s.start("Installing Bun");
-      try {
-        execSync("curl -fsSL https://bun.sh/install | bash", {
-          stdio: "pipe",
-          timeout: 60000,
-        });
-        s.stop(color.green("Bun installed successfully!"));
-
-        // Re-detect runtimes
-        const newRuntimes = detectRuntimes();
-        if (hasBunRuntime()) {
-          p.log.success(
-            "JavaScript and TypeScript will now use Bun " +
-              color.dim("(3-5x faster)"),
-          );
-        }
-        p.note(getRuntimeSummary(newRuntimes), "Updated Runtimes");
-      } catch (err: unknown) {
-        const message =
-          err instanceof Error ? err.message : String(err);
-        s.stop(color.red("Failed to install Bun"));
-        p.log.error(
-          "Installation failed: " +
-            message +
-            "\nYou can install manually: curl -fsSL https://bun.sh/install | bash",
-        );
-        p.log.info(
-          color.dim("Continuing with Node.js — everything will still work."),
-        );
-      }
-    } else {
-      p.log.info(
-        color.dim(
-          "No problem! Using Node.js. You can install Bun later: curl -fsSL https://bun.sh/install | bash",
-        ),
-      );
-    }
-  } else {
-    p.log.success(
-      color.green("Bun detected!") +
-        " JS/TS will run at maximum speed.",
-    );
-  }
-
-  // Step 3: Check optional runtimes
-  const missing: string[] = [];
-  if (!runtimes.python) missing.push("Python (python3)");
-  if (!runtimes.ruby) missing.push("Ruby (ruby)");
-  if (!runtimes.go) missing.push("Go (go)");
-  if (!runtimes.php) missing.push("PHP (php)");
-  if (!runtimes.r) missing.push("R (Rscript)");
-
-  if (missing.length > 0) {
-    p.log.info(
-      color.dim("Optional runtimes not found: " + missing.join(", ")),
-    );
-    p.log.info(
-      color.dim(
-        "Install them to enable additional language support in context-mode.",
-      ),
-    );
-  }
-
-  // Step 4: Installation instructions
-  const installMethod = await p.select({
-    message: "How would you like to configure context-mode?",
-    options: [
-      {
-        value: "claude-code",
-        label: "Claude Code (recommended)",
-        hint: "claude mcp add",
-      },
-      {
-        value: "manual",
-        label: "Show manual configuration",
-        hint: ".mcp.json",
-      },
-      { value: "skip", label: "Skip — I'll configure later" },
-    ],
-  });
-
-  if (p.isCancel(installMethod)) {
-    p.cancel("Setup cancelled.");
-    process.exit(0);
-  }
-
-  const serverPath = new URL("./server.js", import.meta.url).pathname;
-
-  if (installMethod === "claude-code") {
-    s.start("Adding to Claude Code");
-    try {
-      execSync(
-        `claude mcp add context-mode -- node ${serverPath}`,
-        { stdio: "pipe", timeout: 10000 },
-      );
-      s.stop(color.green("Added to Claude Code!"));
-    } catch {
-      s.stop(color.yellow("Could not add automatically"));
-      p.log.info(
-        "Run manually:\n" +
-          color.cyan(`  claude mcp add context-mode -- node ${serverPath}`),
-      );
-    }
-  } else if (installMethod === "manual") {
-    p.note(
-      JSON.stringify(
-        {
-          mcpServers: {
-            "context-mode": {
-              command: "node",
-              args: [serverPath],
-            },
-          },
-        },
-        null,
-        2,
-      ),
-      "Add to your .mcp.json or Claude Code settings",
-    );
-  }
-
-  p.outro(
-    color.green("Setup complete!") +
-      " " +
-      color.dim(available.length + " languages ready."),
-  );
 }

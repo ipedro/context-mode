@@ -1,0 +1,49 @@
+{
+  "$schema": "https://raw.githubusercontent.com/google-gemini/gemini-cli/main/packages/core/src/schema/settings-schema.json",
+  "hooks": {
+    "BeforeTool": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/gemini-cli/beforetool.mjs"
+          }
+        ]
+      }
+    ],
+    "AfterTool": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/gemini-cli/aftertool.mjs"
+          }
+        ]
+      }
+    ],
+    "PreCompress": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/gemini-cli/precompress.mjs"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "matcher": "",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./node_modules/context-mode/hooks/gemini-cli/sessionstart.mjs"
+          }
+        ]
+      }
+    ]
+  }
+}
