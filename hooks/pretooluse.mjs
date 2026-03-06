@@ -40,7 +40,9 @@ try {
   const cacheParent = dirname(myRoot);
   const marker = resolve(tmpdir(), `context-mode-healed-${myVersion}`);
 
-  if (myVersion !== "unknown" && !existsSync(marker)) {
+  // Only self-heal inside plugin cache dirs — skip in dev/CI environments
+  const isInPluginCache = myRoot.includes("/plugins/cache/") || myRoot.includes("\\plugins\\cache\\");
+  if (myVersion !== "unknown" && isInPluginCache && !existsSync(marker)) {
     // 1. If dir name doesn't match version (e.g. "0.7.0" but code is "0.9.12"),
     //    create correct dir, copy files, update registry + hooks
     const correctDir = resolve(cacheParent, myVersion);
