@@ -78,13 +78,35 @@ Both issues below have been resolved in upstream OpenClaw:
 
 ## Minimum Version
 
-**Required: OpenClaw >2026.1.29**
+**Required: OpenClaw >= v2026.3.2**
 
-This is the first release that includes the `api.on()` fix from [PR #9761](https://github.com/openclaw/openclaw/pull/9761), which shipped on 2026-01-29.
+This version includes `before_model_resolve` with `trigger`/`channelId` fields needed for active memory injection. It also includes the earlier `api.on()` fix from [PR #9761](https://github.com/openclaw/openclaw/pull/9761).
 
-**What breaks on older versions:** Lifecycle hooks registered via `api.on()` — including `before_compaction`, `after_compaction`, `session_start`, and tool interception hooks — may silently fail to fire.
+**What breaks on older versions:** Lifecycle hooks registered via `api.on()` — including `before_compaction`, `after_compaction`, `session_start`, and tool interception hooks — may silently fail to fire. Active memory injection requires `before_model_resolve` events, which are only available from v2026.3.2.
 
-**Graceful degradation:** If compaction hooks don't fire, the adapter falls back to DB snapshot reconstruction, rebuilding session state from events already persisted by `after_tool_call`. This produces a less precise snapshot than the PreCompact path but preserves critical state (active files, tasks, errors). The adapter will not crash on older versions, but compaction recovery quality will be reduced.
+**Graceful degradation:** If compaction hooks don't fire, the adapter falls back to DB snapshot reconstruction, rebuilding session state from events already persisted by `after_tool_call`. This produces a less precise snapshot than the PreCompact path but preserves critical state (active files, tasks, errors). The adapter will not crash on older versions, but compaction recovery quality will be reduced. Memory injection silently disables when `before_model_resolve` is unavailable.
+
+## Active Memory Injection
+
+The plugin injects relevant past session events into the system context on every turn using FTS5 BM25-ranked search. This is registered as a `before_prompt_build` hook at priority 7 (between routing at p=5 and resume snapshot at p=10).
+
+### How it works
+
+1. `before_model_resolve` captures the user message in a closure variable
+2. `before_prompt_build` (p=7) queries `session_events_fts` for the top-k most relevant past events
+3. Results are formatted as compact XML (`<memory_context>`) and injected via `prependSystemContext`
+4. Events already present in the resume snapshot are deduplicated
+
+### Configuration
+
+Configure via the plugin's `configSchema` (passed as the second argument to `register()`):
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `memory_injection.enabled` | boolean | `true` | Enable/disable memory injection |
+| `memory_injection.top_k` | integer | `3` | Max events to inject per turn |
+| `memory_injection.min_events` | integer | `3` | Min session events before activation |
+| `memory_injection.min_score` | number | `0.1` | Min BM25 relevance threshold |
 
 ## Workspace Routing
 

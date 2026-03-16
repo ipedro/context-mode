@@ -153,6 +153,36 @@ const configSchema = {
       default: true,
       description: "Enable or disable the context-mode plugin.",
     },
+    memory_injection: {
+      type: "object" as const,
+      properties: {
+        enabled: {
+          type: "boolean" as const,
+          default: true,
+          description: "Enable active memory injection on every turn.",
+        },
+        top_k: {
+          type: "integer" as const,
+          default: 3,
+          description: "Maximum number of past events to inject.",
+        },
+        min_events: {
+          type: "integer" as const,
+          default: 3,
+          description:
+            "Minimum session event count before injection activates.",
+        },
+        min_score: {
+          type: "number" as const,
+          default: 0.1,
+          description:
+            "Minimum BM25 relevance score (events below this are filtered out).",
+        },
+      },
+      additionalProperties: false,
+      default: {},
+      description: "Active memory injection settings.",
+    },
   },
   additionalProperties: false,
 };
@@ -214,7 +244,7 @@ export default {
 
   // OpenClaw calls register() synchronously — returning a Promise causes hooks
   // to be silently ignored. Async init runs eagerly; hooks await it on first use.
-  register(api: OpenClawPluginApi): void {
+  register(api: OpenClawPluginApi, config?: Record<string, unknown>): void {
     // Resolve build dir from compiled JS location
     const buildDir = dirname(fileURLToPath(import.meta.url));
     const projectDir = process.env.OPENCLAW_PROJECT_DIR || process.cwd();
@@ -237,6 +267,7 @@ export default {
     log.info("register() called, sessionId:", sessionId.slice(0, 8));
     let resumeInjected = false;
     let sessionKey: string | undefined;
+    let lastUserMessage = "";
     // Create temp session so after_tool_call events before session_start have a valid row
     db.ensureSession(sessionId, projectDir);
 
@@ -541,6 +572,10 @@ export default {
           const e = event as BeforeModelResolveEvent;
           const messageText = e?.userMessage ?? e?.message ?? e?.content ?? "";
           log.debug("before_model_resolve", { hasMessage: !!messageText });
+          // Capture for memory injection (before_prompt_build p=7)
+          if (messageText) {
+            lastUserMessage = messageText;
+          }
           if (!messageText) return;
           const events = extractUserEvents(messageText);
           for (const ev of events) {
@@ -574,7 +609,75 @@ export default {
       { priority: 10 },
     );
 
-    // ── 8. before_prompt_build — Routing instruction injection ──
+    // ── 8b. before_prompt_build — Active memory injection ──────
+    // Fires every turn (p=7), between routing (p=5) and resume (p=10).
+    // Queries FTS5 for past events relevant to the current user message
+    // and injects them as compact XML system context.
+
+    const memRaw = (config?.memory_injection ?? {}) as Record<string, unknown>;
+    const memCfg = {
+      enabled: memRaw.enabled !== false,          // default: true
+      top_k: Number(memRaw.top_k) || 3,           // default: 3
+      min_events: Number(memRaw.min_events) || 3,  // default: 3
+      min_score: Number(memRaw.min_score) || 0.1,  // default: 0.1
+    };
+
+    api.on(
+      "before_prompt_build",
+      () => {
+        try {
+          if (!memCfg.enabled) return undefined;
+
+          const msg = lastUserMessage;
+          if (!msg) return undefined;
+
+          const sid = sessionId;
+          const eventCount = db.getEventCount(sid);
+          if (eventCount < memCfg.min_events) return undefined;
+
+          const results = db.searchEvents(sid, msg, memCfg.top_k, memCfg.min_score);
+          if (results.length === 0) return undefined;
+
+          // Deduplicate with resume snapshot — if resume was already injected,
+          // exclude events whose data_hash appears in the snapshot text.
+          let filtered = results;
+          const resume = db.getResume(sid);
+          if (resume?.snapshot) {
+            filtered = results.filter(
+              (ev) => !resume.snapshot.includes(ev.data),
+            );
+          }
+          if (filtered.length === 0) return undefined;
+
+          // Format as compact XML, capping at ~500 tokens (~2000 chars)
+          const lines: string[] = ["<memory_context>"];
+          let totalLen = 18; // "<memory_context>" length + newline overhead
+          for (const ev of filtered) {
+            const truncData = ev.data.length > 300 ? ev.data.slice(0, 300) : ev.data;
+            const line = `<event type="${ev.type}" priority="${ev.priority}">${truncData}</event>`;
+            if (totalLen + line.length > 2000) break;
+            lines.push(line);
+            totalLen += line.length + 1;
+          }
+          lines.push("</memory_context>");
+
+          const formatted = lines.join("\n");
+          log.debug("before_prompt_build[memory]", {
+            sessionId: sid.slice(0, 8),
+            query: msg.slice(0, 50),
+            results: results.length,
+            injected: filtered.length,
+          });
+
+          return { prependSystemContext: formatted };
+        } catch {
+          return undefined;
+        }
+      },
+      { priority: 7 },
+    );
+
+    // ── 8c. before_prompt_build — Routing instruction injection ──
 
     if (routingInstructions) {
       api.on(

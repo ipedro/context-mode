@@ -9,6 +9,7 @@
  */
 
 import { SessionDB } from "../../session/db.js";
+import type { StoredEvent } from "../../session/db.js";
 import type { PreparedStatement } from "../../db-base.js";
 
 // ─────────────────────────────────────────────────────────
@@ -50,6 +51,30 @@ export class OpenClawSessionDB extends SessionDB {
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
     `);
+
+    // FTS5 content-sync table for BM25-ranked search over session_events.
+    // Uses content= to avoid data duplication — FTS index is rebuilt from
+    // the base table. content_rowid maps to session_events.id.
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+        data,
+        content='session_events',
+        content_rowid='id'
+      );
+
+      CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
+        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.data);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
+        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.data);
+      END;
+
+      CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
+        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.data);
+        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.data);
+      END;
+    `);
   }
 
   protected prepareStatements(): void {
@@ -84,6 +109,17 @@ export class OpenClawSessionDB extends SessionDB {
 
     p("renameSessionMap",
       `UPDATE openclaw_session_map SET session_id = ? WHERE session_id = ?`);
+
+    p("searchEvents",
+      `SELECT e.id, e.session_id, e.type, e.category, e.priority, e.data,
+              e.source_hook, e.created_at, e.data_hash,
+              rank AS bm25_rank
+       FROM session_events_fts f
+       JOIN session_events e ON e.id = f.rowid
+       WHERE session_events_fts MATCH ?
+         AND e.session_id = ?
+       ORDER BY rank
+       LIMIT ?`);
   }
 
   /** Shorthand to retrieve an OpenClaw-specific cached statement. */
@@ -135,5 +171,53 @@ export class OpenClawSessionDB extends SessionDB {
    */
   removeSessionKey(sessionKey: string): void {
     this.oc("deleteSessionMap").run(sessionKey);
+  }
+
+  // ═══════════════════════════════════════════
+  // FTS5 search
+  // ═══════════════════════════════════════════
+
+  /**
+   * Search session events using FTS5 BM25 ranking.
+   *
+   * Sanitises the query to prevent FTS5 syntax errors from user input,
+   * then runs a MATCH query joined back to session_events for full rows.
+   *
+   * @param sessionId  - Only return events belonging to this session.
+   * @param query      - Free-text search query (user message).
+   * @param topK       - Maximum number of results to return.
+   * @param minScore   - Minimum relevance score (BM25 rank is negative;
+   *                     lower = more relevant). Results with rank > -minScore
+   *                     are filtered out.
+   * @returns Matching StoredEvent rows ordered by relevance.
+   */
+  searchEvents(
+    sessionId: string,
+    query: string,
+    topK: number = 3,
+    minScore: number = 0.1,
+  ): StoredEvent[] {
+    // Sanitise: strip FTS5 operators, collapse whitespace, take first 200 chars
+    const sanitised = query
+      .replace(/[*"():^{}~<>]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 200);
+
+    if (!sanitised) return [];
+
+    try {
+      const rows = this.oc("searchEvents").all(sanitised, sessionId, topK) as Array<
+        StoredEvent & { bm25_rank: number }
+      >;
+      // FTS5 BM25 rank is negative (more negative = more relevant).
+      // Filter out low-relevance results: keep rows where -rank >= minScore.
+      return rows
+        .filter((r) => -r.bm25_rank >= minScore)
+        .map(({ bm25_rank: _, ...event }) => event);
+    } catch {
+      // FTS5 query parse failure — graceful degradation
+      return [];
+    }
   }
 }
