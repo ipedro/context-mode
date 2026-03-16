@@ -52,27 +52,34 @@ export class OpenClawSessionDB extends SessionDB {
       );
     `);
 
-    // FTS5 content-sync table for BM25-ranked search over session_events.
-    // Uses content= to avoid data duplication — FTS index is rebuilt from
-    // the base table. content_rowid maps to session_events.id.
+    // FTS5 index for BM25-ranked search over session_events.
+    // Indexes `type || ' ' || data` so event type tokens (e.g. "file", "read"
+    // from "file_read") are searchable alongside the event data payload.
+    // Contentless (content='') so we fully own the indexed text — joins back
+    // to session_events via rowid for the actual data payload.
+    // Triggers use DROP+CREATE (not IF NOT EXISTS) so existing DBs always get
+    // the current trigger definition when the plugin initialises.
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
         data,
-        content='session_events',
-        content_rowid='id'
+        content='',
+        contentless_delete=1
       );
 
-      CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
-        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.data);
+      DROP TRIGGER IF EXISTS session_events_ai;
+      CREATE TRIGGER session_events_ai AFTER INSERT ON session_events BEGIN
+        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.type || ' ' || new.data);
       END;
 
-      CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
-        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.data);
+      DROP TRIGGER IF EXISTS session_events_ad;
+      CREATE TRIGGER session_events_ad AFTER DELETE ON session_events BEGIN
+        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.type || ' ' || old.data);
       END;
 
-      CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE ON session_events BEGIN
-        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.data);
-        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.data);
+      DROP TRIGGER IF EXISTS session_events_au;
+      CREATE TRIGGER session_events_au AFTER UPDATE ON session_events BEGIN
+        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.type || ' ' || old.data);
+        INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.type || ' ' || new.data);
       END;
     `);
   }
@@ -197,12 +204,18 @@ export class OpenClawSessionDB extends SessionDB {
     topK: number = 3,
     minScore: number = 0.1,
   ): StoredEvent[] {
-    // Sanitise: strip FTS5 operators, collapse whitespace, take first 200 chars
+    // Build an FTS5 OR query from the user message so any matching term returns
+    // results. FTS5 default is implicit AND — with a natural language sentence
+    // that would require every word to appear in the same event row (always 0).
+    // Filter tokens shorter than 3 chars to skip noise ("a", "is", "to", etc.).
     const sanitised = query
       .replace(/[*"():^{}~<>]/g, " ")
       .replace(/\s+/g, " ")
       .trim()
-      .slice(0, 200);
+      .slice(0, 200)
+      .split(" ")
+      .filter((w) => w.length >= 3)
+      .join(" OR ");
 
     if (!sanitised) return [];
 
