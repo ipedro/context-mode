@@ -152,6 +152,14 @@ export function detectPlatform(clientInfo?: { name: string; version?: string }):
     };
   }
 
+  if (existsSync(resolve(home, ".kiro"))) {
+    return {
+      platform: "kiro",
+      confidence: "medium",
+      reason: "~/.kiro/ directory exists",
+    };
+  }
+
   if (existsSync(resolve(home, ".openclaw"))) {
     return {
       platform: "openclaw",

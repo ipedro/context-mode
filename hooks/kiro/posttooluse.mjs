@@ -8,21 +8,16 @@ import "../suppress-stderr.mjs";
  */
 
 import { readStdin, getSessionId, getSessionDBPath, getInputProjectDir, KIRO_OPTS } from "../session-helpers.mjs";
-import { appendFileSync } from "node:fs";
 import { join, dirname } from "node:path";
-import { homedir } from "node:os";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HOOK_DIR = dirname(fileURLToPath(import.meta.url));
 const PKG_SESSION = join(HOOK_DIR, "..", "..", "build", "session");
 const OPTS = KIRO_OPTS;
-const DEBUG_LOG = join(homedir(), ".kiro", "context-mode", "posttooluse-debug.log");
 
 try {
   const raw = await readStdin();
   const input = JSON.parse(raw);
-
-  appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] CALL: ${input.tool_name}\n`);
 
   const { extractEvents } = await import(pathToFileURL(join(PKG_SESSION, "extract.js")).href);
   const { SessionDB } = await import(pathToFileURL(join(PKG_SESSION, "db.js")).href);
@@ -47,12 +42,9 @@ try {
     db.insertEvent(sessionId, event, "PostToolUse");
   }
 
-  appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] OK: ${input.tool_name} → ${events.length} events\n`);
   db.close();
-} catch (err) {
-  try {
-    appendFileSync(DEBUG_LOG, `[${new Date().toISOString()}] ERR: ${err?.message || err}\n`);
-  } catch { /* silent */ }
+} catch {
+  // Non-blocking — swallow errors silently
 }
 
 // PostToolUse is non-blocking — no stdout output

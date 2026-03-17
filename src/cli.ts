@@ -60,6 +60,10 @@ const HOOK_MAP: Record<string, Record<string, string>> = {
     posttooluse: "hooks/cursor/posttooluse.mjs",
     sessionstart: "hooks/cursor/sessionstart.mjs",
   },
+  "kiro": {
+    pretooluse: "hooks/kiro/pretooluse.mjs",
+    posttooluse: "hooks/kiro/posttooluse.mjs",
+  },
 };
 
 async function hookDispatch(platform: string, event: string): Promise<void> {
