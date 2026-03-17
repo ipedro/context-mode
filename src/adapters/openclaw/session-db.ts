@@ -73,12 +73,12 @@ export class OpenClawSessionDB extends SessionDB {
 
       DROP TRIGGER IF EXISTS session_events_ad;
       CREATE TRIGGER session_events_ad AFTER DELETE ON session_events BEGIN
-        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.type || ' ' || old.data);
+        DELETE FROM session_events_fts WHERE rowid = old.id;
       END;
 
       DROP TRIGGER IF EXISTS session_events_au;
       CREATE TRIGGER session_events_au AFTER UPDATE ON session_events BEGIN
-        INSERT INTO session_events_fts(session_events_fts, rowid, data) VALUES ('delete', old.id, old.type || ' ' || old.data);
+        DELETE FROM session_events_fts WHERE rowid = old.id;
         INSERT INTO session_events_fts(rowid, data) VALUES (new.id, new.type || ' ' || new.data);
       END;
     `);
