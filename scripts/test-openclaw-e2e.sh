@@ -8,6 +8,15 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_FILE="${RUNNER_TEMP:-/tmp}/e2e-output.log"
 cd "$REPO_ROOT"
 
+# DB isolation: use a temp HOME so the test never writes to the real ~/.openclaw/
+# In CI, RUNNER_TEMP is set; locally we create a temp directory.
+if [ -z "${E2E_USE_REAL_HOME:-}" ]; then
+  E2E_HOME="$(mktemp -d "${RUNNER_TEMP:-/tmp}/e2e-home-XXXXXX")"
+  export HOME="$E2E_HOME"
+  export E2E_SESSION_DIR="$E2E_HOME/.openclaw/context-mode/sessions"
+  echo "DB isolation: HOME=$E2E_HOME" | tee -a "$LOG_FILE"
+fi
+
 echo "=== context-mode OpenClaw E2E Synthetic Test ===" | tee "$LOG_FILE"
 echo "Repo:    $REPO_ROOT" | tee -a "$LOG_FILE"
 echo "Node:    $(node --version)" | tee -a "$LOG_FILE"
@@ -58,6 +67,7 @@ const hooks = new Map();
 const lifecycle = new Map();
 const commands = new Map();
 let contextEngineId = null;
+let contextEngineFactory = null;
 
 const api = {
   registerHook(event, handler, meta) {
@@ -68,7 +78,7 @@ const api = {
     if (!lifecycle.has(event)) lifecycle.set(event, []);
     lifecycle.get(event).push({ handler, priority: opts?.priority ?? 0 });
   },
-  registerContextEngine(id) { contextEngineId = id; },
+  registerContextEngine(id, factory) { contextEngineId = id; contextEngineFactory = factory; },
   registerCommand(cmd) { commands.set(cmd.name, cmd); },
   logger: {
     info:  (...a) => {},
@@ -101,7 +111,7 @@ expectedLifecycle.forEach(name => {
     : fail(`api.on("${name}") registered`);
 });
 
-["command:new", "command:stop"].forEach(name => {
+["command:new", "command:reset", "command:stop"].forEach(name => {
   hooks.has(name) && hooks.get(name).length > 0
     ? pass(`api.registerHook("${name}") registered`)
     : fail(`api.registerHook("${name}") registered`);
@@ -116,6 +126,23 @@ contextEngineId === "context-mode"
   ? pass("registerContextEngine('context-mode') called")
   : fail("registerContextEngine('context-mode') called", `got: ${contextEngineId}`);
 
+if (contextEngineFactory) {
+  try {
+    const engine = contextEngineFactory();
+    pass(`context engine factory returned object (ownsCompaction=${engine?.info?.ownsCompaction})`);
+    if (typeof engine.compact === "function") {
+      const compactResult = await engine.compact({ messages: [], threshold: 1000 });
+      pass(`context engine compact() returned (compacted=${compactResult?.compacted})`);
+    } else {
+      fail("context engine has compact() method");
+    }
+  } catch (e) {
+    fail("context engine factory/compact()", e.message);
+  }
+} else {
+  fail("registerContextEngine received factory function");
+}
+
 ["/ctx-stats", "/ctx-doctor", "/ctx-upgrade"].forEach(name => {
   commands.has(name.slice(1))
     ? pass(`${name} command registered`)
@@ -126,7 +153,7 @@ contextEngineId === "context-mode"
 section("Phase 5: Hook execution (full lifecycle)");
 
 async function fireLifecycle(event, payload) {
-  const hs = lifecycle.get(event) || [];
+  const hs = (lifecycle.get(event) || []).sort((a, b) => (a.priority || 0) - (b.priority || 0));
   const results = [];
   for (const { handler } of hs) results.push(await handler(payload));
   return results;
@@ -140,18 +167,39 @@ async function fireHook(event) {
 await fireHook("command:new");
 pass("command:new fired");
 
-// 5b. session_start — re-key session
-const testSessionId = randomUUID();
+// 5b. session_start — initial session with sessionKey
+const firstSessionId = randomUUID();
 const testSessionKey = `e2e-agent:test:${Date.now()}`;
+await fireLifecycle("session_start", {
+  sessionId: firstSessionId,
+  sessionKey: testSessionKey,
+  startedAt: new Date().toISOString(),
+});
+pass("session_start fired (initial session with sessionKey)");
+
+// 5b2. session_start — re-key: same sessionKey, different sessionId exercises db.renameSession()
+const testSessionId = randomUUID();
 await fireLifecycle("session_start", {
   sessionId: testSessionId,
   sessionKey: testSessionKey,
   startedAt: new Date().toISOString(),
 });
-pass("session_start fired (sessionKey provided)");
+pass("session_start fired (re-keyed: same sessionKey, new sessionId)");
 
-// Allow initPromise to resolve
-await new Promise(r => setTimeout(r, 600));
+// Allow initPromise to resolve — poll until before_tool_call handler is responsive
+{
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    try {
+      const hs = lifecycle.get("before_tool_call") || [];
+      if (hs.length > 0) {
+        await hs[0].handler({ toolName: "__ping__", params: {} });
+        break;
+      }
+    } catch { /* init still running */ }
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
 
 // 5c. before_tool_call — read tool (should passthrough)
 const btcResult = await (async () => {
@@ -223,9 +271,15 @@ pass(`before_prompt_build fired (${promptResults.length} handlers)`);
 // ── 6. SQLite DB verification ─────────────────────────────
 section("Phase 6: SQLite DB verification");
 
-await new Promise(r => setTimeout(r, 300));
-
-const sessionDir = join(homedir(), ".openclaw", "context-mode", "sessions");
+// Poll for session DB to appear (retry with timeout ceiling)
+const sessionDir = process.env.E2E_SESSION_DIR || join(homedir(), ".openclaw", "context-mode", "sessions");
+{
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    if (existsSync(sessionDir) && readdirSync(sessionDir).some(f => f.endsWith(".db"))) break;
+    await new Promise(r => setTimeout(r, 50));
+  }
+}
 if (!existsSync(sessionDir)) {
   fail("session directory exists", sessionDir);
   process.exit(1);
@@ -281,13 +335,13 @@ console.log(`       event types: ${types.map(t => `${t.type}(${t.cnt})`).join(",
 const resume = db.prepare("SELECT COUNT(*) as cnt FROM session_resume").get();
 resume.cnt > 0
   ? pass(`session_resume has ${resume.cnt} snapshot(s) — before_compaction fired correctly`)
-  : warn("session_resume is empty — compaction hook may not have produced a snapshot yet");
+  : fail("session_resume is empty — before_compaction must produce a snapshot");
 
 // openclaw_session_map
 const mapRow = db.prepare("SELECT * FROM openclaw_session_map WHERE session_key = ?").get(testSessionKey);
 mapRow
   ? pass(`openclaw_session_map entry for key '${testSessionKey.slice(0,20)}...' → ${mapRow.session_id.slice(0,8)}`)
-  : warn(`openclaw_session_map entry not found for test key — session re-keying may differ`);
+  : fail(`openclaw_session_map entry not found for test key — session_start must write session map`);
 
 db.close();
 
@@ -309,8 +363,14 @@ if (statsCmd) {
   fail("/ctx-stats handler callable");
 }
 
-// ── 8. command:stop ────────────────────────────────────────
+// ── 8. command:reset + command:stop ───────────────────────
 section("Phase 8: Cleanup");
+try {
+  await fireHook("command:reset");
+  pass("command:reset fired without throwing");
+} catch (e) {
+  fail("command:reset", e.message);
+}
 try {
   await fireHook("command:stop");
   pass("command:stop fired without throwing");

@@ -4,8 +4,20 @@ on:
   workflow_dispatch:
   push:
     branches: [main, next]
+    paths:
+      - 'src/**'
+      - 'hooks/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
   pull_request:
     branches: [main, next]
+    paths:
+      - 'src/**'
+      - 'hooks/**'
+      - 'scripts/**'
+      - 'package.json'
+      - 'package-lock.json'
 
 concurrency:
   group: openclaw-e2e-${{ github.ref }}
@@ -13,13 +25,14 @@ concurrency:
 
 env:
   OPENCLAW_VERSION: "2026.3.2"
-  NODE_VERSION: "22"
+  NODE_VERSION: "20"
 
 jobs:
   e2e:
     strategy:
       fail-fast: false
       matrix:
+        # windows-latest excluded: OpenClaw is Linux/macOS only, install script uses bash
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     name: openclaw-e2e (${{ matrix.os }})
@@ -49,11 +62,8 @@ jobs:
           path: ~/.npm-global
           key: openclaw-${{ runner.os }}-v${{ env.OPENCLAW_VERSION }}
 
-      - name: Install dependencies and build
-        run: |
-          npm install
-          npm run build
-          npm rebuild better-sqlite3
+      - name: Install dependencies
+        run: npm install
 
       - name: Install OpenClaw
         if: steps.cache-openclaw.outputs.cache-hit != 'true'
@@ -107,7 +117,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: session-dbs-${{ matrix.os }}
-          path: ~/.openclaw/context-mode/sessions/
+          path: ${{ runner.temp }}/e2e-home-*/.openclaw/context-mode/sessions/
           if-no-files-found: ignore
 
       - name: Upload OpenClaw logs on failure
