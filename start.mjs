@@ -6,10 +6,11 @@ import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const originalCwd = process.cwd();
 process.chdir(__dirname);
 
 if (!process.env.CLAUDE_PROJECT_DIR) {
-  process.env.CLAUDE_PROJECT_DIR = process.cwd();
+  process.env.CLAUDE_PROJECT_DIR = originalCwd;
 }
 
 // Auto-write routing instructions file for the detected platform
