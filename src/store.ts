@@ -650,6 +650,49 @@ export class ContentStore {
     return bestDist <= maxDist ? bestWord : null;
   }
 
+  // ── Reciprocal Rank Fusion (Cormack et al. 2009) ──
+
+  #rrfSearch(
+    query: string,
+    limit: number,
+    source?: string,
+    contentType?: "code" | "prose",
+  ): SearchResult[] {
+    const K = 60; // Standard RRF constant
+    const fetchLimit = Math.max(limit * 2, 10);
+
+    const porterResults = this.search(query, fetchLimit, source, "OR", contentType);
+    const trigramResults = this.searchTrigram(query, fetchLimit, source, "OR", contentType);
+
+    const scoreMap = new Map<string, { result: SearchResult; score: number }>();
+    const key = (r: SearchResult) => `${r.source}::${r.title}`;
+
+    for (const [i, r] of porterResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) {
+        existing.score += 1 / (K + i + 1);
+      } else {
+        scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+      }
+    }
+
+    for (const [i, r] of trigramResults.entries()) {
+      const k = key(r);
+      const existing = scoreMap.get(k);
+      if (existing) {
+        existing.score += 1 / (K + i + 1);
+      } else {
+        scoreMap.set(k, { result: r, score: 1 / (K + i + 1) });
+      }
+    }
+
+    return Array.from(scoreMap.values())
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit)
+      .map(({ result, score }) => ({ ...result, rank: -score }));
+  }
+
   // ── Unified Fallback Search ──
 
   searchWithFallback(
@@ -658,37 +701,13 @@ export class ContentStore {
     source?: string,
     contentType?: "code" | "prose",
   ): SearchResult[] {
-    // Layer 1a: Porter + AND (most precise)
-    const porterAnd = this.search(query, limit, source, "AND", contentType);
-    if (porterAnd.length > 0) {
-      return porterAnd.map((r) => ({ ...r, matchLayer: "porter" as const }));
+    // Step 1: RRF fusion (porter OR + trigram OR → merge)
+    const rrfResults = this.#rrfSearch(query, limit, source, contentType);
+    if (rrfResults.length > 0) {
+      return rrfResults.map((r) => ({ ...r, matchLayer: "rrf" as const }));
     }
 
-    // Layer 1b: Porter + OR (fallback when AND finds nothing)
-    const porterOr = this.search(query, limit, source, "OR", contentType);
-    if (porterOr.length > 0) {
-      return porterOr.map((r) => ({ ...r, matchLayer: "porter" as const }));
-    }
-
-    // Layer 2a: Trigram + AND
-    const trigramAnd = this.searchTrigram(query, limit, source, "AND", contentType);
-    if (trigramAnd.length > 0) {
-      return trigramAnd.map((r) => ({
-        ...r,
-        matchLayer: "trigram" as const,
-      }));
-    }
-
-    // Layer 2b: Trigram + OR
-    const trigramOr = this.searchTrigram(query, limit, source, "OR", contentType);
-    if (trigramOr.length > 0) {
-      return trigramOr.map((r) => ({
-        ...r,
-        matchLayer: "trigram" as const,
-      }));
-    }
-
-    // Layer 3: Fuzzy correction + re-search (AND then OR)
+    // Step 2: Fuzzy correction → RRF re-run
     const words = query
       .toLowerCase()
       .trim()
@@ -699,21 +718,9 @@ export class ContentStore {
     const correctedQuery = correctedWords.join(" ");
 
     if (correctedQuery !== original) {
-      const fuzzyPorterAnd = this.search(correctedQuery, limit, source, "AND", contentType);
-      if (fuzzyPorterAnd.length > 0) {
-        return fuzzyPorterAnd.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyPorterOr = this.search(correctedQuery, limit, source, "OR", contentType);
-      if (fuzzyPorterOr.length > 0) {
-        return fuzzyPorterOr.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyTrigramAnd = this.searchTrigram(correctedQuery, limit, source, "AND", contentType);
-      if (fuzzyTrigramAnd.length > 0) {
-        return fuzzyTrigramAnd.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
-      }
-      const fuzzyTrigramOr = this.searchTrigram(correctedQuery, limit, source, "OR", contentType);
-      if (fuzzyTrigramOr.length > 0) {
-        return fuzzyTrigramOr.map((r) => ({ ...r, matchLayer: "fuzzy" as const }));
+      const fuzzyResults = this.#rrfSearch(correctedQuery, limit, source, contentType);
+      if (fuzzyResults.length > 0) {
+        return fuzzyResults.map((r) => ({ ...r, matchLayer: "rrf-fuzzy" as const }));
       }
     }
 

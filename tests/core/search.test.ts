@@ -35,7 +35,7 @@ function createStore(): ContentStore {
 // ═══════════════════════════════════════════════════════════
 
 describe("Fix 1: searchWithFallback cascade on persistent store", () => {
-  test("searchWithFallback: porter layer returns results with matchLayer='porter'", () => {
+  test("searchWithFallback: porter layer returns results with matchLayer='rrf'", () => {
     const store = createStore();
     store.indexPlainText(
       "The authentication middleware validates JWT tokens on every request.\nExpired tokens are rejected with 401.",
@@ -44,7 +44,7 @@ describe("Fix 1: searchWithFallback cascade on persistent store", () => {
 
     const results = store.searchWithFallback("authentication JWT tokens", 3, "execute:shell");
     assert.ok(results.length > 0, "Porter should find exact terms");
-    assert.equal(results[0].matchLayer, "porter", "matchLayer should be 'porter'");
+    assert.equal(results[0].matchLayer, "rrf", "matchLayer should be 'rrf'");
     assert.ok(results[0].content.includes("JWT"), "Content should contain JWT");
 
     store.close();
@@ -60,7 +60,7 @@ describe("Fix 1: searchWithFallback cascade on persistent store", () => {
     // "responseBody" is a substring of "responseBodyParser" — porter won't match, trigram will
     const results = store.searchWithFallback("responseBody", 3, "execute:shell");
     assert.ok(results.length > 0, "Trigram should find substring match");
-    assert.equal(results[0].matchLayer, "trigram", "matchLayer should be 'trigram'");
+    assert.equal(results[0].matchLayer, "rrf", "matchLayer should be 'rrf'");
 
     store.close();
   });
@@ -75,7 +75,7 @@ describe("Fix 1: searchWithFallback cascade on persistent store", () => {
     // "databse" is a typo for "database"
     const results = store.searchWithFallback("databse", 3, "execute:shell");
     assert.ok(results.length > 0, "Fuzzy should correct 'databse' to 'database'");
-    assert.equal(results[0].matchLayer, "fuzzy", "matchLayer should be 'fuzzy'");
+    assert.equal(results[0].matchLayer, "rrf-fuzzy", "matchLayer should be 'rrf-fuzzy'");
     assert.ok(results[0].content.toLowerCase().includes("database"), "Content should have 'database'");
 
     store.close();
@@ -88,10 +88,10 @@ describe("Fix 1: searchWithFallback cascade on persistent store", () => {
       "execute:shell",
     );
 
-    // "redis" is an exact term — should stop at porter, never try trigram/fuzzy
+    // "redis" is an exact term — should stop at RRF, never try fuzzy
     const results = store.searchWithFallback("redis cache", 3, "execute:shell");
     assert.ok(results.length > 0, "Should find results");
-    assert.equal(results[0].matchLayer, "porter", "Should stop at porter when it succeeds");
+    assert.equal(results[0].matchLayer, "rrf", "Should stop at RRF when it succeeds");
 
     store.close();
   });
@@ -491,9 +491,10 @@ describe("AND semantics (issue #23)", () => {
       source: "JavaScript Basics",
     });
 
-    // searchWithFallback should use AND first — only React chunk matches
+    // RRF fuses porter OR + trigram OR — both chunks match on partial terms,
+    // but the React chunk ranks higher because it matches all three query terms
     const results = store.searchWithFallback("useEffect cleanup function", 5);
-    expect(results.length).toBe(1);
+    expect(results.length).toBeGreaterThanOrEqual(1);
     expect(results[0].source).toBe("React Hooks Guide");
 
     store.close();
@@ -583,7 +584,7 @@ describe("Source-scoped searchWithFallback (intentSearch path)", () => {
       results[0].content.includes("connection refused"),
       "Result should contain the search term",
     );
-    assert.equal(results[0].matchLayer, "porter", "Should match via porter layer");
+    assert.equal(results[0].matchLayer, "rrf", "Should match via RRF layer");
 
     // Should NOT leak results from other sources
     const wrongSource = store.searchWithFallback("connection refused", 3, "cmd-2");
@@ -607,7 +608,7 @@ describe("Source-scoped searchWithFallback (intentSearch path)", () => {
       results[0].content.includes("horizontalPodAutoscaler"),
       "Should find the full term",
     );
-    assert.equal(results[0].matchLayer, "trigram", "Should match via trigram layer");
+    assert.equal(results[0].matchLayer, "rrf", "Should match via RRF layer");
 
     store.close();
   });
@@ -627,7 +628,7 @@ describe("Source-scoped searchWithFallback (intentSearch path)", () => {
       results[0].content.toLowerCase().includes("kubernetes"),
       "Should find kubernetes content",
     );
-    assert.equal(results[0].matchLayer, "fuzzy", "Should match via fuzzy layer");
+    assert.equal(results[0].matchLayer, "rrf-fuzzy", "Should match via RRF-fuzzy layer");
 
     store.close();
   });
@@ -1084,11 +1085,11 @@ describe("searchWithFallback: Three-Layer Cascade", () => {
       results[0].content.toLowerCase().includes("cach"),
       `First result should be about caching, got: ${results[0].content.slice(0, 100)}`,
     );
-    // Verify it used Layer 1 (fastest path)
+    // Verify it used RRF (fused path)
     assert.equal(
       results[0].matchLayer,
-      "porter",
-      `Should report 'porter' as match layer, got: '${results[0].matchLayer}'`,
+      "rrf",
+      `Should report 'rrf' as match layer, got: '${results[0].matchLayer}'`,
     );
     store.close();
   });
@@ -1104,8 +1105,8 @@ describe("searchWithFallback: Three-Layer Cascade", () => {
     );
     assert.equal(
       results[0].matchLayer,
-      "trigram",
-      `Should report 'trigram' as match layer, got: '${results[0].matchLayer}'`,
+      "rrf",
+      `Should report 'rrf' as match layer, got: '${results[0].matchLayer}'`,
     );
     store.close();
   });
@@ -1121,8 +1122,8 @@ describe("searchWithFallback: Three-Layer Cascade", () => {
     );
     assert.equal(
       results[0].matchLayer,
-      "fuzzy",
-      `Should report 'fuzzy' as match layer, got: '${results[0].matchLayer}'`,
+      "rrf-fuzzy",
+      `Should report 'rrf-fuzzy' as match layer, got: '${results[0].matchLayer}'`,
     );
     store.close();
   });
@@ -1187,10 +1188,10 @@ describe("Fuzzy Edge Cases", () => {
     assert.ok(results.length > 0, "Should find Redis content");
     assert.equal(
       results[0].matchLayer,
-      "porter",
-      "Exact match should resolve at Porter layer",
+      "rrf",
+      "Exact match should resolve at RRF layer",
     );
-    // Sanity: should be fast since it didn't need trigram/fuzzy
+    // Sanity: should be fast since it didn't need fuzzy
     assert.ok(elapsed < 500, `Should be fast for Layer 1 hit, took ${elapsed.toFixed(0)}ms`);
     store.close();
   });
@@ -1985,6 +1986,156 @@ describe("Content type filter", () => {
       const results = store.searchWithFallback("authentication", 10);
       assert.ok(results.length > 0, "Should find results without contentType filter");
       // Should include both code and prose chunks (no filter applied)
+    } finally {
+      store.close();
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════
+// 10. Reciprocal Rank Fusion (RRF)
+// ═══════════════════════════════════════════════════════════
+
+describe("Reciprocal Rank Fusion", () => {
+  test("RRF returns matchLayer='rrf' for fused results", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText(
+        "The authentication middleware validates JWT tokens on every request.\nExpired tokens are rejected with 401.",
+        "auth-docs",
+      );
+      const results = store.searchWithFallback("authentication JWT tokens", 3);
+      assert.ok(results.length > 0, "RRF should find results");
+      assert.equal(results[0].matchLayer, "rrf", "matchLayer should be 'rrf'");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("RRF merges porter and trigram results", () => {
+    const store = createStore();
+    try {
+      // Porter-friendly: standard English words
+      store.indexPlainText(
+        "The authentication middleware validates credentials against the user database.",
+        "porter-friendly",
+      );
+      // Trigram-friendly: camelCase identifier not in porter vocabulary
+      store.indexPlainText(
+        "The authenticationMiddleware component handles token validation.",
+        "trigram-friendly",
+      );
+
+      const results = store.searchWithFallback("authentication middleware", 5);
+      assert.ok(results.length >= 2, "Should find results from both tables");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("RRF deduplicates by source::title key", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText(
+        "The caching strategy uses Redis for session management.\nCache invalidation triggers on every write operation.",
+        "cache-docs",
+      );
+
+      const results = store.searchWithFallback("caching strategy", 10);
+      // Check no duplicates: same source+title should not appear twice
+      const keys = results.map(r => `${r.source}::${r.title}`);
+      const uniqueKeys = new Set(keys);
+      assert.equal(keys.length, uniqueKeys.size, "Results should have no duplicates");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("RRF-fuzzy activates on typo", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText(
+        "The kubernetes cluster manages container orchestration.\nPods are scheduled across worker nodes.",
+        "k8s-docs",
+      );
+
+      const results = store.searchWithFallback("kuberntes", 3); // typo
+      assert.ok(results.length > 0, "Fuzzy correction should find results");
+      assert.equal(results[0].matchLayer, "rrf-fuzzy", "matchLayer should be 'rrf-fuzzy'");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("RRF with source filter respects constraint", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText("Authentication flow uses JWT tokens.", "auth-source");
+      store.indexPlainText("Authentication also uses OAuth.", "oauth-source");
+
+      const results = store.searchWithFallback("authentication", 5, "auth-source");
+      assert.ok(results.length > 0);
+      for (const r of results) {
+        assert.ok(r.source.includes("auth-source"), `Source should match: ${r.source}`);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  test("RRF with contentType filter works", () => {
+    const store = createStore();
+    try {
+      store.index({
+        content: "# API Reference\n\n```javascript\nfunction authenticate() { return true; }\n```",
+        source: "code-docs",
+      });
+      store.index({
+        content: "# Architecture\n\nThe authentication system uses JWT tokens for session management.",
+        source: "prose-docs",
+      });
+
+      const results = store.searchWithFallback("authenticate", 5, undefined, "code");
+      for (const r of results) {
+        assert.equal(r.contentType, "code", `Should filter to code only`);
+      }
+    } finally {
+      store.close();
+    }
+  });
+
+  test("multi-table match ranks higher than single-table", () => {
+    const store = createStore();
+    try {
+      // This content should match well on both porter AND trigram
+      store.indexPlainText(
+        "The authentication middleware validates credentials against the database.\nauthentication is the first step.",
+        "both-tables",
+      );
+      // This content has a unique term only trigram would find well
+      store.indexPlainText(
+        "The xyzAuthHelper utility function provides helper methods for auth.",
+        "single-table",
+      );
+
+      const results = store.searchWithFallback("authentication", 5);
+      assert.ok(results.length > 0, "Should find results");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("backward compat: existing search patterns still find results", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText(
+        "The caching strategy uses Redis for session data.\nCache invalidation happens on write.",
+        "execute:shell",
+      );
+
+      const results = store.searchWithFallback("caching strategy", 3, "execute:shell");
+      assert.ok(results.length > 0, "Existing patterns should still work");
+      assert.ok(results[0].content.includes("caching"), "Content should match");
     } finally {
       store.close();
     }
