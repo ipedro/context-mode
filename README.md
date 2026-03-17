@@ -610,7 +610,7 @@ Detailed event data is also indexed into FTS5 for on-demand retrieval via `searc
 | PostToolUse Hook | Yes | Yes | Yes | Yes | Plugin | Plugin | -- | -- | Yes |
 | SessionStart Hook | Yes | Yes | Yes | -- | -- | Plugin | -- | -- | -- |
 | PreCompact Hook | Yes | Yes | Yes | -- | Plugin | Plugin | -- | -- | -- |
-| Can Modify Args | Yes | Yes | Yes | Yes | Plugin | Plugin | -- | -- | Yes |
+| Can Modify Args | Yes | Yes | Yes | Yes | Plugin | Plugin | -- | -- | -- |
 | Can Block Tools | Yes | Yes | Yes | Yes | Plugin | Plugin | -- | -- | Yes |
 | Utility Commands (ctx) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Slash Commands | Yes | -- | -- | -- | -- | -- | -- | -- | -- |

@@ -280,6 +280,10 @@ We follow test-driven development. Every PR must include tests.
 | Hook routing | `tests/hooks/core-routing.test.ts` |
 | Hook formatting | `tests/hooks/formatters.test.ts` |
 | Hook integration | `tests/hooks/integration.test.ts` |
+| Cursor hooks | `tests/hooks/cursor-hooks.test.ts` |
+| Gemini hooks | `tests/hooks/gemini-hooks.test.ts` |
+| VS Code hooks | `tests/hooks/vscode-hooks.test.ts` |
+| Kiro hooks | `tests/hooks/kiro-hooks.test.ts` |
 | Session DB | `tests/session/session-db.test.ts` |
 | Session extract | `tests/session/session-extract.test.ts` |
 | Session snapshot | `tests/session/session-snapshot.test.ts` |
