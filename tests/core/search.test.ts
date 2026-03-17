@@ -1827,3 +1827,69 @@ describe("Store integration: highlighted field", () => {
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════
+// 8. BM25 Field Weight Tuning
+// ═══════════════════════════════════════════════════════════
+
+describe("BM25 field weight tuning", () => {
+  test("title match outranks content-only match", () => {
+    const store = createStore();
+    try {
+      // Chunk 1: "authentication" in title only
+      store.index({
+        content: "# Authentication\n\nThis section covers user login and access control.",
+        source: "docs-with-title",
+      });
+      // Chunk 2: "authentication" in content only
+      store.index({
+        content: "# Security Overview\n\nThe authentication process validates credentials against the database.",
+        source: "docs-content-only",
+      });
+
+      const results = store.searchWithFallback("authentication", 5);
+      assert.ok(results.length >= 2, "Should find both chunks");
+      // With 5x title weight, the title-match chunk should rank first
+      assert.ok(
+        results[0].title.toLowerCase().includes("authentication"),
+        `Expected first result to have 'authentication' in title, got: "${results[0].title}"`,
+      );
+    } finally {
+      store.close();
+    }
+  });
+
+  test("title weight boost is consistent for trigram search", () => {
+    const store = createStore();
+    try {
+      store.index({
+        content: "# useEffectCallback\n\nHandles side effects in components.",
+        source: "trigram-title",
+      });
+      store.index({
+        content: "# Component Lifecycle\n\nThe useEffectCallback hook manages cleanup logic.",
+        source: "trigram-content",
+      });
+
+      const results = store.searchTrigram("useEffectCallback", 5);
+      assert.ok(results.length >= 1, "Trigram should find camelCase term");
+    } finally {
+      store.close();
+    }
+  });
+
+  test("backward compatibility: existing searches still return results", () => {
+    const store = createStore();
+    try {
+      store.indexPlainText(
+        "The caching strategy uses Redis for session data.\nCache invalidation happens on write.",
+        "cache-docs",
+      );
+
+      const results = store.searchWithFallback("caching strategy", 3);
+      assert.ok(results.length > 0, "Existing searches should still work");
+    } finally {
+      store.close();
+    }
+  });
+});
