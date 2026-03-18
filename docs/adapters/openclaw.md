@@ -44,7 +44,7 @@ See [`scripts/install-openclaw-plugin.sh`](../../scripts/install-openclaw-plugin
 **"runtime/openclaw.runtime.json not found"**
 OpenClaw creates this file on first launch. Start OpenClaw once (`openclaw gateway start`), then re-run the install script. This is the most common issue for users who install context-mode before ever starting OpenClaw.
 
-**"OPENCLAW_STATE_DIR does not exist"**
+**"OPENCLAW_STATE_DIR (/path) does not exist. Is OpenClaw installed?"**
 The state directory doesn't exist at the expected path. If you installed OpenClaw via npm (not git clone), check where it stores state — common locations are `~/.openclaw` or `/openclaw`. Pass the correct path: `npm run install:openclaw -- /path/to/state`.
 
 **Plugin installed but not loading**

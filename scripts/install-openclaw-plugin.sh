@@ -99,7 +99,7 @@ if (!allow.includes('context-mode')) allow.unshift('context-mode');
 const entries = plugins.entries ??= {};
 if (!entries['context-mode']) entries['context-mode'] = { enabled: true };
 
-fs.writeFileSync(runtimePath, JSON.stringify(cfg, null, 2));
+fs.writeFileSync(runtimePath, JSON.stringify(cfg, null, 2) + '\n');
 console.log('  plugins.allow:', JSON.stringify(allow));
 " "$RUNTIME_JSON" "$PLUGIN_ROOT"
 
